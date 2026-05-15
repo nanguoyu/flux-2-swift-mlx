@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "Flux2Swift",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v14)],
     products: [
         // Libraries
         .library(name: "FluxTextEncoders", targets: ["FluxTextEncoders"]),
@@ -19,7 +19,10 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.2.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
         .package(url: "https://github.com/jpsim/Yams", from: "5.1.0"),
-        .package(url: "https://github.com/VincentGourbin/swift-mlx-profiler", from: "1.1.1"),
+        // Forked to lower platform requirement to macOS 14 (the upstream's
+        // macOS 15 floor is author-set and the source uses no 15-only API).
+        // See: nanguoyu/swift-mlx-profiler @ vasa-macos14
+        .package(url: "https://github.com/nanguoyu/swift-mlx-profiler", branch: "vasa-macos14"),
     ],
     targets: [
         // MARK: - Libraries
