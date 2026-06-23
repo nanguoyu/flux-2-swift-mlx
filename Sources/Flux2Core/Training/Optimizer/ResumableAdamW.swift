@@ -13,22 +13,17 @@ public final class ResumableAdamW: AdamW, ResumableOptimizer {
     /// Step counter for bias correction (not used in MLX's Adam, but useful for logging)
     public private(set) var step: Int = 0
 
-    /// Initialize the optimizer
-    public override init(
-        learningRate: Float,
-        betas: (Float, Float) = (0.9, 0.999),
-        eps: Float = 1e-8,
-        weightDecay: Float = 0.01
-    ) {
-        super.init(learningRate: learningRate, betas: betas, eps: eps, weightDecay: weightDecay)
-    }
+    // The custom initializer was removed: mlx-swift 0.31's `AdamW.init` added a `biasCorrection`
+    // parameter, so the old override matched no designated initializer. `step` has a default
+    // value and this class declares no designated initializer, so it inherits AdamW's inits
+    // (callers using `learningRate:betas:eps:weightDecay:` still work — `biasCorrection` defaults).
 
-    /// Override update to track step count
+    /// Override update to track step count.
     public override func applySingle(
         gradient: MLXArray,
         parameter: MLXArray,
-        state: TupleState
-    ) -> (MLXArray, TupleState) {
+        state: AdamState
+    ) -> (MLXArray, AdamState) {
         step += 1
         return super.applySingle(gradient: gradient, parameter: parameter, state: state)
     }
