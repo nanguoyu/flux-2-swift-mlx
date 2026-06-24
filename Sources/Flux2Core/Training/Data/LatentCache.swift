@@ -6,7 +6,9 @@ import MLX
 import MLXNN
 import CoreGraphics
 import ImageIO
+#if os(macOS)
 import AppKit
+#endif
 
 /// Cached latent entry
 public struct CachedLatent: @unchecked Sendable {

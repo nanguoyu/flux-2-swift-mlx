@@ -43,7 +43,11 @@ public struct ImageProcessorConfig: Codable, Sendable {
     }
 }
 
-/// Image processor for Pixtral vision encoder
+/// Image processor for Pixtral vision encoder.
+/// AppKit-only: the whole class drives NSImage in its public signatures, and the only consumer is
+/// the macOS-gated Pixtral/Mistral VLM path (Klein 4B text2img never needs it). Guarded so the
+/// FluxTextEncoders library compiles on iOS; macOS keeps it byte-for-byte (canImport(AppKit)==true).
+#if canImport(AppKit)
 public class ImageProcessor {
     public let config: ImageProcessorConfig
 
@@ -245,6 +249,7 @@ public class ImageProcessor {
         return (patchesX, patchesY, patchesX * patchesY)
     }
 }
+#endif
 
 /// Errors for image processing
 public enum ImageProcessorError: LocalizedError {

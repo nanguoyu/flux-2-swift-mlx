@@ -44,13 +44,27 @@ public class TextEncoderModelDownloader {
         return cacheDir.appendingPathComponent("models")
     }
 
+    /// Cross-platform base for the default/legacy model lookups. macOS has a real user home
+    /// (`~/.mistral`, `~/.cache/huggingface`); iOS has none (`homeDirectoryForCurrentUser` is
+    /// unavailable there), so fall back to the app's caches directory — the legacy
+    /// `~/.cache/huggingface` paths simply won't exist on iOS, which is correct (models download
+    /// fresh into the caches dir).
+    static var legacyHomeDirectory: URL {
+        #if os(iOS)
+        return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        #else
+        return FileManager.default.homeDirectoryForCurrentUser
+        #endif
+    }
+
     /// Legacy models directory (Mistral).
     /// Uses customModelsDirectory if set, otherwise falls back to ~/.mistral/models
     public static var modelsDirectory: URL {
         if let custom = customModelsDirectory {
             return custom
         }
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+        let homeDir = legacyHomeDirectory
         return homeDir.appendingPathComponent(".mistral").appendingPathComponent("models")
     }
 
@@ -79,7 +93,7 @@ public class TextEncoderModelDownloader {
         }
 
         // Check legacy location: ~/.cache/huggingface/hub/models--{org}--{repo}/snapshots/...
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+        let homeDir = legacyHomeDirectory
         let hubCache = homeDir
             .appendingPathComponent(".cache")
             .appendingPathComponent("huggingface")
@@ -360,7 +374,7 @@ public class TextEncoderModelDownloader {
         }
 
         // Check legacy location
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+        let homeDir = legacyHomeDirectory
         let hubCache = homeDir
             .appendingPathComponent(".cache")
             .appendingPathComponent("huggingface")
@@ -413,7 +427,7 @@ public class TextEncoderModelDownloader {
         }
 
         // Check legacy location
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+        let homeDir = legacyHomeDirectory
         let hubCache = homeDir
             .appendingPathComponent(".cache")
             .appendingPathComponent("huggingface")
@@ -513,7 +527,7 @@ public class TextEncoderModelDownloader {
         }
 
         // Check legacy Hub cache location
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+        let homeDir = legacyHomeDirectory
         let hubCache = homeDir
             .appendingPathComponent(".cache")
             .appendingPathComponent("huggingface")

@@ -48,9 +48,13 @@ public struct MemoryConfig {
     }
 
     /// Estimate available RAM in GB (rough heuristic)
-    /// Reserves ~8GB for system + other apps
+    /// Reserves ~8GB for system + other apps on macOS; less on iOS where total RAM is much smaller.
     public static var estimatedAvailableRAMGB: Int {
-        max(8, systemRAMGB - 8)
+        #if os(iOS)
+        return max(2, systemRAMGB - 2)
+        #else
+        return max(8, systemRAMGB - 8)
+        #endif
     }
 
     /// Calculate what percentage of RAM we can safely use for GPU cache
@@ -111,8 +115,13 @@ public struct MemoryConfig {
 
         let adjustedLimit = Int(Double(baseLimit) * scaleFactor * modelFactor)
 
-        // Clamp to available RAM (leave at least 8GB for system)
+        // Clamp to available RAM (leave headroom for the system; less on iOS where RAM is smaller
+        // and an 8GB reserve would clamp an 8GB iPhone to a 0-byte cache limit).
+        #if os(iOS)
+        let maxAllowed = max(2, systemRAMGB - 2) * GB
+        #else
         let maxAllowed = (systemRAMGB - 8) * GB
+        #endif
         return min(adjustedLimit, maxAllowed)
     }
 

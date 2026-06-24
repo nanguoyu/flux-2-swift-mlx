@@ -18,6 +18,11 @@ public enum ModelRegistry {
         case klein4B_bf16 = "klein4b-bf16"
         case klein4B_8bit = "klein4b-8bit"
 
+        // Flux.2 Klein 4B pre-quantized 4-bit (mflux-format: packed weight/scales/biases, group size 64).
+        // Loads directly into a QuantizedLinear shell with no float16 intermediate — the only Klein
+        // transformer that fits an iPhone's memory budget.
+        case klein4B_4bit = "klein4b-4bit"
+
         // Flux.2 Klein 4B Base (non-distilled - for LoRA training only)
         case klein4B_base_bf16 = "klein4b-base-bf16"
 
@@ -42,6 +47,9 @@ public enum ModelRegistry {
             case .klein4B_8bit:
                 // Community 8-bit quantization (contains only transformer weights)
                 return "aydin99/FLUX.2-klein-4B-int8"
+            case .klein4B_4bit:
+                // mflux pre-quantized 4-bit (transformer/ subfolder; packed weight/scales/biases)
+                return "mlx-community/flux2-klein-4b-4bit"
             case .klein4B_base_bf16:
                 // Base model (non-distilled) for LoRA training
                 return "black-forest-labs/FLUX.2-klein-base-4B"
@@ -65,6 +73,9 @@ public enum ModelRegistry {
             case .klein4B_bf16, .klein4B_8bit, .klein9B_bf16, .klein9B_kv_bf16:
                 // Klein distilled/community models have transformer weights in root folder
                 return nil
+            case .klein4B_4bit:
+                // mlx-community repo keeps the transformer weights under a transformer/ subfolder
+                return "transformer"
             case .klein4B_base_bf16, .klein9B_base_bf16:
                 // Klein base models (official BFL repos) use diffusers layout with transformer/ subfolder
                 return "transformer"
@@ -77,6 +88,7 @@ public enum ModelRegistry {
             case .qint8: return 32
             case .klein4B_bf16: return 8
             case .klein4B_8bit: return 4
+            case .klein4B_4bit: return 2  // ~2.18GB pre-quantized transformer
             case .klein4B_base_bf16: return 8  // Same size as distilled
             case .klein9B_bf16: return 18
             case .klein9B_base_bf16: return 18  // Same size as distilled
@@ -98,6 +110,9 @@ public enum ModelRegistry {
                 return false
             case .klein4B_8bit:
                 // Community 8-bit quantization is NOT gated
+                return false
+            case .klein4B_4bit:
+                // mlx-community pre-quantized 4-bit is NOT gated
                 return false
             case .klein4B_base_bf16:
                 // Klein 4B Base from black-forest-labs is NOT gated
@@ -148,6 +163,7 @@ public enum ModelRegistry {
             switch self {
             case .bf16, .klein4B_bf16, .klein4B_base_bf16, .klein9B_bf16, .klein9B_base_bf16, .klein9B_kv_bf16: return .bf16
             case .qint8, .klein4B_8bit: return .qint8
+            case .klein4B_4bit: return .int4
             }
         }
 
@@ -156,7 +172,7 @@ public enum ModelRegistry {
             switch self {
             case .bf16, .qint8:
                 return .dev
-            case .klein4B_bf16, .klein4B_8bit:
+            case .klein4B_bf16, .klein4B_8bit, .klein4B_4bit:
                 return .klein4B
             case .klein4B_base_bf16:
                 return .klein4BBase
@@ -175,7 +191,7 @@ public enum ModelRegistry {
             switch self {
             case .bf16, .qint8:  // Dev
                 return true
-            case .klein4B_bf16, .klein4B_8bit:  // Klein 4B distilled
+            case .klein4B_bf16, .klein4B_8bit, .klein4B_4bit:  // Klein 4B distilled
                 return true
             case .klein9B_bf16:  // Klein 9B distilled
                 return true
@@ -194,7 +210,7 @@ public enum ModelRegistry {
                 return true
             case .qint8:  // Dev int8 - cannot train (quantized)
                 return false
-            case .klein4B_bf16, .klein4B_8bit:  // Distilled - cannot train
+            case .klein4B_bf16, .klein4B_8bit, .klein4B_4bit:  // Distilled - cannot train
                 return false
             case .klein9B_bf16:  // Distilled - cannot train
                 return false
@@ -446,23 +462,28 @@ public enum ModelRegistry {
     public static func localPath(for component: ModelComponent) -> URL {
         switch component {
         case .transformer(let variant):
+            // Most transformer variants live under the black-forest-labs org; the mlx-community
+            // pre-quantized 4-bit checkpoint is the exception.
+            let org: String
             let modelName: String
             switch variant {
             case .bf16, .qint8:
-                modelName = "FLUX.2-dev-transformer-\(variant.rawValue)"
+                org = "black-forest-labs"; modelName = "FLUX.2-dev-transformer-\(variant.rawValue)"
             case .klein4B_bf16, .klein4B_8bit:
-                modelName = "FLUX.2-klein-4B-\(variant.rawValue)"
+                org = "black-forest-labs"; modelName = "FLUX.2-klein-4B-\(variant.rawValue)"
+            case .klein4B_4bit:
+                org = "mlx-community"; modelName = "flux2-klein-4b-4bit"
             case .klein4B_base_bf16:
-                modelName = "FLUX.2-klein-base-4B-\(variant.rawValue)"
+                org = "black-forest-labs"; modelName = "FLUX.2-klein-base-4B-\(variant.rawValue)"
             case .klein9B_bf16:
-                modelName = "FLUX.2-klein-9B-\(variant.rawValue)"
+                org = "black-forest-labs"; modelName = "FLUX.2-klein-9B-\(variant.rawValue)"
             case .klein9B_base_bf16:
-                modelName = "FLUX.2-klein-base-9B-\(variant.rawValue)"
+                org = "black-forest-labs"; modelName = "FLUX.2-klein-base-9B-\(variant.rawValue)"
             case .klein9B_kv_bf16:
-                modelName = "FLUX.2-klein-9b-kv-\(variant.rawValue)"
+                org = "black-forest-labs"; modelName = "FLUX.2-klein-9b-kv-\(variant.rawValue)"
             }
             return modelsDirectory
-                .appendingPathComponent("black-forest-labs")
+                .appendingPathComponent(org)
                 .appendingPathComponent(modelName)
         case .textEncoder(let variant):
             // Mistral models are handled by MistralCore
@@ -502,8 +523,15 @@ public enum ModelRegistry {
     /// Expected files for each component
     public static func expectedFiles(for component: ModelComponent) -> [String] {
         switch component {
-        case .transformer:
-            return ["config.json", "model.safetensors.index.json"]
+        case .transformer(let variant):
+            switch variant {
+            case .klein4B_4bit:
+                // mflux pre-quantized 4-bit ships only the sharded weights + index (no config.json);
+                // the Klein 4B architecture is hardcoded in Flux2Config.
+                return ["model.safetensors.index.json"]
+            default:
+                return ["config.json", "model.safetensors.index.json"]
+            }
         case .textEncoder:
             return ["config.json", "model.safetensors.index.json", "tokenizer.json"]
         case .vae:

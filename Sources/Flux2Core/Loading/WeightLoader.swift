@@ -468,6 +468,85 @@ public class Flux2WeightLoader {
         return mapped
     }
 
+    // MARK: - Pre-quantized (MLX) Transformer Loading
+
+    /// Detect an MLX pre-quantized checkpoint (mflux-produced, e.g. `mlx-community/flux2-klein-4b-4bit`):
+    /// every quantized `Linear` carries `.scales`/`.biases` siblings. This is unambiguous — quanto qint8
+    /// uses `._scale` (underscore), and bf16 has no scales at all — so a single `.scales` suffix is a
+    /// safe signal to take the direct quantized-load path instead of the float materialize-then-quantize
+    /// path. Lets us load the packed weights straight into a `QuantizedLinear` shell with no spike.
+    public static func isMLXPreQuantizedFormat(_ weights: [String: MLXArray]) -> Bool {
+        weights.keys.contains { $0.hasSuffix(".scales") }
+    }
+
+    /// Map an mflux/Diffusers-named pre-quantized transformer key to the Swift module path, preserving
+    /// the `.weight`/`.scales`/`.biases` suffix. Two deliberate differences from `mapTransformerKeySimple`:
+    ///  - it nests the time embedder correctly (`time_guidance_embed.linear_1` →
+    ///    `timeGuidanceEmbed.timestepEmbedder.linear1`); the generic mapper drops the `.timestepEmbedder.`
+    ///    level and the weights would silently land in `notFound`, leaving the time embedder uninitialized
+    ///    (black output); and
+    ///  - it never touches the BFL adaLN scale/shift half-swap — mflux `norm_out.linear` is already
+    ///    `[scale|shift]`, and that swap lives only in `mapBFLTransformerWeights`, which this never calls.
+    static func mapMLXQuantizedTransformerKey(_ key: String) -> String {
+        if key.hasPrefix("time_guidance_embed.linear_1.") {
+            return "timeGuidanceEmbed.timestepEmbedder.linear1." + String(key.dropFirst("time_guidance_embed.linear_1.".count))
+        }
+        if key.hasPrefix("time_guidance_embed.linear_2.") {
+            return "timeGuidanceEmbed.timestepEmbedder.linear2." + String(key.dropFirst("time_guidance_embed.linear_2.".count))
+        }
+        return mapTransformerKeySimple(key)
+    }
+
+    /// Apply pre-quantized MLX weights (packed `.weight`/`.scales`/`.biases`) directly to an
+    /// ALREADY-quantized transformer. The model MUST have been passed through
+    /// `quantize(model:groupSize:bits:)` first so its `Linear` layers are `QuantizedLinear` with the
+    /// matching three-tensor param layout. No float16 intermediate, no format auto-detect, no adaLN swap.
+    ///
+    /// Verifies in both directions: every checkpoint key must match a model parameter (`notFound == 0`)
+    /// AND every quantized model layer must receive a checkpoint value — if the `quantize()` predicate
+    /// diverged from the checkpoint, some layer would otherwise run with uninitialized weights and
+    /// produce garbage with no error. Either mismatch throws.
+    public static func applyPreQuantizedTransformerWeights(
+        _ weights: inout [String: MLXArray],
+        to model: Flux2Transformer2DModel
+    ) throws {
+        // Map keys (Diffusers → Swift, carrying the quant suffix). Drain the input dict as we go.
+        var mapped: [String: MLXArray] = [:]
+        for key in Array(weights.keys) {
+            guard let value = weights.removeValue(forKey: key) else { continue }
+            let base = key.hasPrefix("transformer.") ? String(key.dropFirst("transformer.".count)) : key
+            mapped[mapMLXQuantizedTransformerKey(base)] = value
+        }
+
+        // Snapshot the quantized model's flattened parameter keys.
+        var modelKeys = Set<String>()
+        for (k, _) in model.parameters().flattened() { modelKeys.insert(k) }
+
+        var updates: [String: MLXArray] = [:]
+        var notFound: [String] = []
+        for (k, v) in mapped {
+            if modelKeys.contains(k) { updates[k] = v } else { notFound.append(k) }
+        }
+
+        // Reverse check: each quantized layer (identified by its `.scales` param) must be filled.
+        let modelScaleKeys = modelKeys.filter { $0.hasSuffix(".scales") }
+        let unfilledScales = modelScaleKeys.filter { updates[$0] == nil }
+
+        _ = model.update(parameters: ModuleParameters.unflattened(updates))
+
+        Flux2Debug.log("Pre-quantized direct-load: applied \(updates.count) tensors; \(notFound.count) checkpoint keys unmatched; \(unfilledScales.count)/\(modelScaleKeys.count) quant layers unfilled")
+        if !notFound.isEmpty {
+            for k in notFound.sorted().prefix(15) { Flux2Debug.log("  unmatched checkpoint key: \(k)") }
+            throw Flux2WeightLoaderError.weightMismatch(
+                "\(notFound.count) pre-quantized checkpoint keys did not match any model parameter (first: \(notFound.sorted().first ?? ""))")
+        }
+        if !unfilledScales.isEmpty {
+            for k in unfilledScales.sorted().prefix(15) { Flux2Debug.log("  unfilled model quant layer: \(k)") }
+            throw Flux2WeightLoaderError.weightMismatch(
+                "\(unfilledScales.count) quantized model layers received no checkpoint weight — quantize() predicate diverged from the checkpoint")
+        }
+    }
+
     // MARK: - VAE Weight Mapping
 
     /// Convert HuggingFace VAE weight keys to Swift module paths

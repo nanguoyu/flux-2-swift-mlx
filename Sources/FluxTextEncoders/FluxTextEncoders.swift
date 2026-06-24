@@ -33,7 +33,9 @@ public final class FluxTextEncoders: @unchecked Sendable {
     private var tokenizer: TekkenTokenizer?
     private var generator: MistralGenerator?
     private var extractor: EmbeddingExtractor?
-    private var imageProcessor: ImageProcessor?
+    #if canImport(AppKit)
+    private var imageProcessor: ImageProcessor?  // Pixtral preprocessor — AppKit-only (NSImage)
+    #endif
     
     // Qwen3/Klein support
     private var qwen3Model: Qwen3ForCausalLM?
@@ -52,10 +54,15 @@ public final class FluxTextEncoders: @unchecked Sendable {
     // Qwen3.5 VLM service
     private var qwen35VLM: Qwen35VLM?
 
+    #if canImport(AppKit)
     /// Whether VLM (vision) model is loaded
     public var isVLMLoaded: Bool {
         return vlmModel != nil && tokenizer != nil && imageProcessor != nil
     }
+    #else
+    /// The Pixtral/Mistral VLM is macOS-only; it is never loaded on iOS.
+    public var isVLMLoaded: Bool { false }
+    #endif
     
     /// Whether Qwen3/Klein model is loaded
     public var isKleinLoaded: Bool {
@@ -122,6 +129,7 @@ public final class FluxTextEncoders: @unchecked Sendable {
         FluxDebug.log("Model loaded successfully")
     }
 
+    #if canImport(AppKit)
     /// Load VLM (vision-language) model from path
     @MainActor
     public func loadVLMModel(from path: String) throws {
@@ -160,6 +168,7 @@ public final class FluxTextEncoders: @unchecked Sendable {
 
         try loadVLMModel(from: modelPath.path)
     }
+    #endif
 
     /// Unload model to free memory
     @MainActor
@@ -169,7 +178,9 @@ public final class FluxTextEncoders: @unchecked Sendable {
         tokenizer = nil
         generator = nil
         extractor = nil
+        #if canImport(AppKit)
         imageProcessor = nil
+        #endif
         qwen3Model = nil
         kleinExtractor = nil
         qwen3Tokenizer = nil
@@ -810,6 +821,7 @@ public final class FluxTextEncoders: @unchecked Sendable {
         fflush(stdout)
     }
 
+    #if canImport(AppKit)
     /// Analyze an image with a text prompt and optional system prompt
     /// - Parameters:
     ///   - image: NSImage to analyze
@@ -994,6 +1006,7 @@ public final class FluxTextEncoders: @unchecked Sendable {
         let image = try processor.loadImage(from: path)
         return try analyzeImage(image: image, prompt: prompt, systemPrompt: systemPrompt, parameters: parameters, onToken: onToken)
     }
+    #endif
 
     /// Format vision prompt following Mistral chat template
     private func formatVisionPrompt(imageToken: String, userPrompt: String) -> String {
