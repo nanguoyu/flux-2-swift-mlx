@@ -7,7 +7,9 @@ import Foundation
 import MLXNN
 import MLXOptimizers
 import CoreGraphics
+#if os(macOS)
 import AppKit
+#endif
 import ImageIO
 import UniformTypeIdentifiers
 import FluxTextEncoders

@@ -74,6 +74,11 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// Quantization configuration
     public let quantization: Flux2QuantizationConfig
 
+    /// Forces a specific transformer variant, overriding `variant(for:)`. Used to select the
+    /// pre-quantized `klein4B_4bit` checkpoint on memory-constrained devices (iPhone) without
+    /// changing the on-the-fly quantization path Mac uses for the same precision (nil = auto).
+    public let transformerVariantOverride: ModelRegistry.TransformerVariant?
+
     /// Memory optimization settings for transformer inference
     public var memoryOptimization: MemoryOptimizationConfig
 
@@ -132,16 +137,25 @@ public class Flux2Pipeline: @unchecked Sendable {
         quantization: Flux2QuantizationConfig = .balanced,
         memoryOptimization: MemoryOptimizationConfig? = nil,
         vaeVariant: ModelRegistry.VAEVariant = .smallDecoder,
+        transformerVariantOverride: ModelRegistry.TransformerVariant? = nil,
         hfToken: String? = nil
     ) {
         self.model = model
         self.quantization = quantization
+        self.transformerVariantOverride = transformerVariantOverride
         self.vaeVariant = vaeVariant
         self.memoryOptimization = memoryOptimization ?? MemoryOptimizationConfig.recommended(
             forRAMGB: Flux2MemoryManager.shared.physicalMemoryGB
         )
         self.scheduler = FlowMatchEulerScheduler()
         self.downloader = hfToken != nil ? Flux2ModelDownloader(hfToken: hfToken) : Flux2ModelDownloader()
+    }
+
+    /// The transformer variant this pipeline will download/find/load — the explicit override when set,
+    /// otherwise the default `variant(for:)` mapping from model + requested quantization.
+    var resolvedTransformerVariant: ModelRegistry.TransformerVariant {
+        transformerVariantOverride
+            ?? ModelRegistry.TransformerVariant.variant(for: model, quantization: quantization.transformer)
     }
 
     // MARK: - Model Loading
@@ -265,8 +279,9 @@ public class Flux2Pipeline: @unchecked Sendable {
         memoryManager.logMemoryState()
         Flux2Debug.log("Loading transformer for \(model.displayName)...")
 
-        // Get the appropriate transformer variant based on model type and quantization
-        let variant = ModelRegistry.TransformerVariant.variant(for: model, quantization: quantization.transformer)
+        // Get the appropriate transformer variant (honours an explicit override, e.g. the
+        // pre-quantized klein4B_4bit on iPhone)
+        let variant = resolvedTransformerVariant
 
         // Find model path
         guard let modelPath = Flux2ModelDownloader.findModelPath(for: .transformer(variant)) else {
@@ -296,34 +311,54 @@ public class Flux2Pipeline: @unchecked Sendable {
         Flux2Debug.log("Loading transformer weights from disk...")
         var weights = try Flux2WeightLoader.loadWeights(from: modelPath)
 
-        Flux2Debug.log("Applying weights to model...")
-        try Flux2WeightLoader.applyTransformerWeights(&weights, to: transformer!)
-
-        // Explicitly release the raw weights dictionary to free memory
-        // This is important for Dev model where weights can be ~32GB
-        weights.removeAll()
-        eval([])  // Sync to ensure weights are released
-        memoryManager.fullCleanup()
-        Flux2Debug.log("Raw weights released from memory")
-
-        // Quantize transformer to native MLX QuantizedLinear if requested
-        // This handles both:
-        // 1. Pre-quantized weights (quanto→float16→MLX qint8): negligible precision loss
-        // 2. On-the-fly quantization from bf16 (e.g. Klein 9B qint8, any model int4)
-        // The quantization uses MLX's native QuantizedLinear format which:
-        // - Reduces memory usage proportionally to bit width (8-bit: ~50%, 4-bit: ~75%)
-        // - Uses optimized quantizedMM() for faster inference on Apple Silicon
-        // - Enables efficient dequant→merge→requant for LoRA weight merging
-        if quantization.transformer != .bf16 {
-            let bits = quantization.transformer.bits
-            let groupSize = quantization.transformer.groupSize
-            Flux2Debug.log("Quantizing transformer on-the-fly to \(bits)-bit (groupSize=\(groupSize))...")
+        if Flux2WeightLoader.isMLXPreQuantizedFormat(weights) {
+            // Pre-quantized MLX checkpoint (mflux-format, e.g. mlx-community/flux2-klein-4b-4bit).
+            // Quantize the bf16 shell to QuantizedLinear FIRST, then load the packed
+            // weight/scales/biases straight from disk — the float16 intermediate is never
+            // materialized, so peak stays ~2.2GB (fits iPhone) instead of the ~7GB on-the-fly spike.
+            // The bit width / group size come from the variant (its checkpoint's actual quantization),
+            // not the requested quantization, so this is correct regardless of how the caller asked.
+            let bits = variant.quantization.bits
+            let groupSize = variant.quantization.groupSize
+            Flux2Debug.log("Pre-quantized MLX transformer detected — quantizing shell to \(bits)-bit (groupSize=\(groupSize)) then direct-loading")
             memoryManager.logMemoryState()
             quantize(model: transformer!, groupSize: groupSize, bits: bits)
+            try Flux2WeightLoader.applyPreQuantizedTransformerWeights(&weights, to: transformer!)
+            weights.removeAll()
             eval(transformer!.parameters())
             memoryManager.fullCleanup()
             memoryManager.logMemoryState()
-            Flux2Debug.log("Transformer quantized to QuantizedLinear (\(bits)-bit)")
+            Flux2Debug.log("Pre-quantized transformer loaded (direct, no float16 spike)")
+        } else {
+            Flux2Debug.log("Applying weights to model...")
+            try Flux2WeightLoader.applyTransformerWeights(&weights, to: transformer!)
+
+            // Explicitly release the raw weights dictionary to free memory
+            // This is important for Dev model where weights can be ~32GB
+            weights.removeAll()
+            eval([])  // Sync to ensure weights are released
+            memoryManager.fullCleanup()
+            Flux2Debug.log("Raw weights released from memory")
+
+            // Quantize transformer to native MLX QuantizedLinear if requested
+            // This handles both:
+            // 1. Pre-quantized weights (quanto→float16→MLX qint8): negligible precision loss
+            // 2. On-the-fly quantization from bf16 (e.g. Klein 9B qint8, any model int4)
+            // The quantization uses MLX's native QuantizedLinear format which:
+            // - Reduces memory usage proportionally to bit width (8-bit: ~50%, 4-bit: ~75%)
+            // - Uses optimized quantizedMM() for faster inference on Apple Silicon
+            // - Enables efficient dequant→merge→requant for LoRA weight merging
+            if quantization.transformer != .bf16 {
+                let bits = quantization.transformer.bits
+                let groupSize = quantization.transformer.groupSize
+                Flux2Debug.log("Quantizing transformer on-the-fly to \(bits)-bit (groupSize=\(groupSize))...")
+                memoryManager.logMemoryState()
+                quantize(model: transformer!, groupSize: groupSize, bits: bits)
+                eval(transformer!.parameters())
+                memoryManager.fullCleanup()
+                memoryManager.logMemoryState()
+                Flux2Debug.log("Transformer quantized to QuantizedLinear (\(bits)-bit)")
+            }
         }
 
         // Merge LoRA weights if any are loaded
@@ -1832,8 +1867,8 @@ extension Flux2Pipeline {
 extension Flux2Pipeline {
     /// Check if required models are downloaded
     public var hasRequiredModels: Bool {
-        // Check transformer - use the appropriate variant for this model type and quantization
-        let transformerVariant = ModelRegistry.TransformerVariant.variant(for: model, quantization: quantization.transformer)
+        // Check transformer - use the resolved variant (honours an explicit override)
+        let transformerVariant = resolvedTransformerVariant
         let hasTransformer = Flux2ModelDownloader.isDownloaded(.transformer(transformerVariant))
 
         // Text encoder is handled by MistralCore/FluxTextEncoders, skip check here
@@ -1848,8 +1883,8 @@ extension Flux2Pipeline {
     public var missingModels: [ModelRegistry.ModelComponent] {
         var missing: [ModelRegistry.ModelComponent] = []
 
-        // Use the appropriate transformer variant for this model type
-        let transformerVariant = ModelRegistry.TransformerVariant.variant(for: model, quantization: quantization.transformer)
+        // Use the resolved transformer variant for this model type (honours an explicit override)
+        let transformerVariant = resolvedTransformerVariant
         if !Flux2ModelDownloader.isDownloaded(.transformer(transformerVariant)) {
             missing.append(.transformer(transformerVariant))
         }

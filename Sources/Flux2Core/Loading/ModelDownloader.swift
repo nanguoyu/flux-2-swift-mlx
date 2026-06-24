@@ -23,6 +23,10 @@ public class Flux2ModelDownloader: @unchecked Sendable {
 
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForResource = 3600  // 1 hour for large models
+        // iOS otherwise caches large downloads in URLCache, doubling on-disk usage for multi-GB
+        // models (the same bug the Z-Image downloader hit). Disable it — harmless on macOS.
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
         self.session = URLSession(configuration: config)
     }
 
@@ -38,11 +42,13 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         // Check our local models directory
         let localPath = ModelRegistry.localPath(for: component)
 
-        // Check for config.json OR model_index.json (Klein models use the latter)
+        // Accept config.json OR model_index.json (Klein diffusers) OR model.safetensors.index.json
+        // (mflux pre-quantized shards ship no config.json — the arch is hardcoded in Flux2Config).
         let hasConfig = FileManager.default.fileExists(atPath: localPath.appendingPathComponent("config.json").path)
         let hasModelIndex = FileManager.default.fileExists(atPath: localPath.appendingPathComponent("model_index.json").path)
+        let hasShardIndex = FileManager.default.fileExists(atPath: localPath.appendingPathComponent("model.safetensors.index.json").path)
 
-        if hasConfig || hasModelIndex {
+        if hasConfig || hasModelIndex || hasShardIndex {
             let verification = verifyModel(at: localPath)
             if verification.complete {
                 return localPath
@@ -59,15 +65,18 @@ public class Flux2ModelDownloader: @unchecked Sendable {
 
         let cacheHasConfig = FileManager.default.fileExists(atPath: path.appendingPathComponent("config.json").path)
         let cacheHasModelIndex = FileManager.default.fileExists(atPath: path.appendingPathComponent("model_index.json").path)
+        let cacheHasShardIndex = FileManager.default.fileExists(atPath: path.appendingPathComponent("model.safetensors.index.json").path)
 
-        if cacheHasConfig || cacheHasModelIndex {
+        if cacheHasConfig || cacheHasModelIndex || cacheHasShardIndex {
             let verification = verifyModel(at: path)
             if verification.complete {
                 return path
             }
         }
 
-        // Check legacy HuggingFace cache
+        // Check legacy HuggingFace CLI cache (~/.cache/huggingface/hub). macOS only — iOS has no
+        // user home directory, and models are downloaded fresh into the app's caches directory.
+        #if os(macOS)
         let homeDir = FileManager.default.homeDirectoryForCurrentUser
         let hubCache = homeDir
             .appendingPathComponent(".cache")
@@ -85,15 +94,18 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         let modelPath = snapshotsDir.appendingPathComponent(latestSnapshot)
         let configPath = modelPath.appendingPathComponent("config.json")
         let modelIndexPath = modelPath.appendingPathComponent("model_index.json")
+        let shardIndexPath = modelPath.appendingPathComponent("model.safetensors.index.json")
 
         if FileManager.default.fileExists(atPath: configPath.path) ||
-           FileManager.default.fileExists(atPath: modelIndexPath.path) {
+           FileManager.default.fileExists(atPath: modelIndexPath.path) ||
+           FileManager.default.fileExists(atPath: shardIndexPath.path) {
             // Verify safetensors files are complete
             let verification = verifyModel(at: modelPath)
             if verification.complete {
                 return modelPath
             }
         }
+        #endif
 
         return nil
     }
@@ -125,6 +137,21 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         // Klein bf16 models use flux-2-klein-*.safetensors naming
         if safetensorsFiles.contains(where: { $0.hasPrefix("flux-2-klein") }) {
             return (true, [])
+        }
+
+        // mflux pre-quantized sharded layout: numbered shards (0.safetensors, 1.safetensors, …)
+        // enumerated in model.safetensors.index.json — no config.json, and not the model-N-of-T naming.
+        // Verify via the index's weight_map: every referenced shard file must be present.
+        let indexURL = path.appendingPathComponent("model.safetensors.index.json")
+        if FileManager.default.fileExists(atPath: indexURL.path) {
+            guard let data = try? Data(contentsOf: indexURL),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let weightMap = json["weight_map"] as? [String: String] else {
+                return (false, ["unreadable model.safetensors.index.json"])
+            }
+            let requiredShards = Set(weightMap.values)
+            let missingShards = requiredShards.subtracting(safetensorsFiles)
+            return (missingShards.isEmpty, missingShards.sorted())
         }
 
         // Check for sharded model

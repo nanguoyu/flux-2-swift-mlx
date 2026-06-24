@@ -3,7 +3,10 @@ import PackageDescription
 
 let package = Package(
     name: "Flux2Swift",
-    platforms: [.macOS(.v14)],
+    // iOS 17+ so the Flux2Core + FluxTextEncoders libraries can be consumed on iPhone (the
+    // AppKit/Pixtral/Training surfaces are guarded out). The CLI/App executable targets remain
+    // macOS-only in practice — they're never built in the iOS app graph.
+    platforms: [.macOS(.v14), .iOS(.v17)],
     products: [
         // Libraries
         .library(name: "FluxTextEncoders", targets: ["FluxTextEncoders"]),

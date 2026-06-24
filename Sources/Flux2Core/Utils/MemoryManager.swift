@@ -25,8 +25,14 @@ public final class Flux2MemoryManager: @unchecked Sendable {
 
     /// Estimated available memory (rough heuristic)
     public var estimatedAvailableMemoryGB: Int {
+        #if os(iOS)
+        // iOS caps per-app memory via jetsam well below total RAM; an 8GB reserve would zero out
+        // an 8GB iPhone. Reserve a smaller slice so estimates/warnings stay meaningful.
+        return max(1, physicalMemoryGB - 2)
+        #else
         // Reserve some memory for system
-        max(0, physicalMemoryGB - 8)
+        return max(0, physicalMemoryGB - 8)
+        #endif
     }
 
     private init() {}
