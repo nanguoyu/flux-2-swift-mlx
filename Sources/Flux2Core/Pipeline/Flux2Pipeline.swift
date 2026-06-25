@@ -1310,6 +1310,10 @@ public class Flux2Pipeline: @unchecked Sendable {
             let finalLatents = LatentUtils.unpatchifyLatents(finalPatchified)
             eval(finalLatents)
 
+            #if os(iOS)
+            unloadTransformer()   // free the ~2.18GB transformer before decode (see the T2I site)
+            #endif
+
             let decoded = vae!.decode(finalLatents)
             eval(decoded)
             profiler.end("7. VAE Decode")
@@ -1480,6 +1484,14 @@ public class Flux2Pipeline: @unchecked Sendable {
         let finalLatents = LatentUtils.unpatchifyLatents(patchifiedFinal)
         Flux2Debug.log("Final latents for VAE: \(finalLatents.shape)")
         eval(finalLatents)
+
+        #if os(iOS)
+        // iPhone: free the resident ~2.18GB 4-bit transformer before the heavy full-frame VAE decode,
+        // so the decode activations don't stack on top of it and cross the jetsam ceiling (the cause of
+        // the standard-VAE step-4 crash / thermal restart). The next generate() reloads it via the
+        // `transformer == nil` guard; Mac keeps it resident for throughput.
+        unloadTransformer()
+        #endif
 
         // === PHASE 3: Decode to Image ===
         Flux2Debug.log("=== PHASE 3: VAE Decoding ===")
