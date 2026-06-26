@@ -487,7 +487,7 @@ public class Flux2WeightLoader {
     ///    (black output); and
     ///  - it never touches the BFL adaLN scale/shift half-swap — mflux `norm_out.linear` is already
     ///    `[scale|shift]`, and that swap lives only in `mapBFLTransformerWeights`, which this never calls.
-    static func mapMLXQuantizedTransformerKey(_ key: String) -> String {
+    public static func mapMLXQuantizedTransformerKey(_ key: String) -> String {
         if key.hasPrefix("time_guidance_embed.linear_1.") {
             return "timeGuidanceEmbed.timestepEmbedder.linear1." + String(key.dropFirst("time_guidance_embed.linear_1.".count))
         }
