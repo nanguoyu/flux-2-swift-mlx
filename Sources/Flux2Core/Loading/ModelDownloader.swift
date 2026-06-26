@@ -2,12 +2,30 @@
 // Copyright 2025 Vincent Gourbin
 
 import Foundation
+import CryptoKit
 
 /// Progress callback for download updates
 public typealias Flux2DownloadProgressCallback = @Sendable (Double, String) -> Void
 
 /// Downloads Flux.2 models from HuggingFace Hub
 public class Flux2ModelDownloader: @unchecked Sendable {
+    private struct HubFile: Sendable {
+        var path: String
+        var size: Int64?
+        var sha256: String?
+    }
+
+    private struct DownloadManifest: Codable {
+        struct File: Codable {
+            var filename: String
+            var size: Int64?
+            var sha256: String?
+        }
+        var version: Int = 1
+        var files: [File]
+    }
+
+    private static let manifestFilename = ".mobile-diffuser-download-manifest.json"
 
     /// HuggingFace token for gated models
     private var hfToken: String?
@@ -50,7 +68,7 @@ public class Flux2ModelDownloader: @unchecked Sendable {
 
         if hasConfig || hasModelIndex || hasShardIndex {
             let verification = verifyModel(at: localPath)
-            if verification.complete {
+            if verification.complete && verifyManifestIfPresent(at: localPath) {
                 return localPath
             }
         }
@@ -69,7 +87,7 @@ public class Flux2ModelDownloader: @unchecked Sendable {
 
         if cacheHasConfig || cacheHasModelIndex || cacheHasShardIndex {
             let verification = verifyModel(at: path)
-            if verification.complete {
+            if verification.complete && verifyManifestIfPresent(at: path) {
                 return path
             }
         }
@@ -101,7 +119,7 @@ public class Flux2ModelDownloader: @unchecked Sendable {
            FileManager.default.fileExists(atPath: shardIndexPath.path) {
             // Verify safetensors files are complete
             let verification = verifyModel(at: modelPath)
-            if verification.complete {
+            if verification.complete && verifyManifestIfPresent(at: modelPath) {
                 return modelPath
             }
         }
@@ -225,9 +243,9 @@ public class Flux2ModelDownloader: @unchecked Sendable {
 
         // Filter to only necessary files
         let filesToDownload = files.filter { file in
-            file.hasSuffix(".safetensors") ||
-            file.hasSuffix(".json") ||
-            file == "tokenizer.model"
+            file.path.hasSuffix(".safetensors") ||
+            file.path.hasSuffix(".json") ||
+            file.path == "tokenizer.model"
         }
 
         guard !filesToDownload.isEmpty else {
@@ -239,28 +257,45 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
 
         // Download each file
-        var downloadedBytes: Int64 = 0
-        let totalFiles = filesToDownload.count
+        let totalBytes = max(1, filesToDownload.reduce(Int64(0)) { $0 + ($1.size ?? 0) })
+        var completedBytes: Int64 = 0
 
-        for (index, file) in filesToDownload.enumerated() {
-            let fileName = URL(fileURLWithPath: file).lastPathComponent
-            progress?(Double(index) / Double(totalFiles), "Downloading \(fileName)...")
+        for file in filesToDownload {
+            let fileName = URL(fileURLWithPath: file.path).lastPathComponent
+            let destination = destDir.appendingPathComponent(fileName)
+            if Self.fileMatches(destination, expectedSize: file.size, expectedSHA256: file.sha256) {
+                completedBytes += file.size ?? Self.fileSize(destination)
+                progress?(min(1, Double(completedBytes) / Double(totalBytes)), "Verified \(fileName)")
+                continue
+            }
+            progress?(Double(completedBytes) / Double(totalBytes), "Downloading \(fileName)...")
 
+            let baseBytes = completedBytes
             let fileURL = try await downloadFile(
                 repoId: repoId,
-                filePath: file,
-                to: destDir.appendingPathComponent(fileName)
+                filePath: file.path,
+                to: destination,
+                expectedSize: file.size,
+                expectedSHA256: file.sha256,
+                progress: { bytes in
+                    progress?(min(1, Double(baseBytes + bytes) / Double(totalBytes)), "Downloading \(fileName)...")
+                }
             )
 
             if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
                let size = attrs[.size] as? Int64 {
-                downloadedBytes += size
+                completedBytes += size
             }
 
-            Flux2Debug.log("Downloaded \(fileName) (\(Self.formatSize(downloadedBytes)) total)")
+            Flux2Debug.log("Downloaded \(fileName) (\(Self.formatSize(completedBytes)) total)")
         }
 
-        progress?(1.0, "Download complete: \(Self.formatSize(downloadedBytes))")
+        let verification = Self.verifyModel(at: destDir)
+        guard verification.complete else { throw Flux2DownloadError.verificationFailed(verification.missing) }
+
+        try Self.writeManifest(filesToDownload, at: destDir)
+
+        progress?(1.0, "Download complete: \(Self.formatSize(completedBytes))")
         return destDir
     }
 
@@ -277,11 +312,12 @@ public class Flux2ModelDownloader: @unchecked Sendable {
     }
 
     /// Fetch file list from HuggingFace API
-    private func fetchFileList(repoId: String, subfolder: String?) async throws -> [String] {
+    private func fetchFileList(repoId: String, subfolder: String?) async throws -> [HubFile] {
         var urlString = "https://huggingface.co/api/models/\(repoId)/tree/main"
         if let subfolder = subfolder {
             urlString += "/\(subfolder)"
         }
+        urlString += "?recursive=1&expand=1"
 
         guard let url = URL(string: urlString) else {
             throw Flux2DownloadError.downloadFailed("Invalid URL: \(urlString)")
@@ -319,11 +355,15 @@ public class Flux2ModelDownloader: @unchecked Sendable {
             throw Flux2DownloadError.downloadFailed("Invalid JSON response")
         }
 
-        var files: [String] = []
+        var files: [HubFile] = []
         for item in json {
             if let type = item["type"] as? String, type == "file",
                let path = item["path"] as? String {
-                files.append(path)
+                let size = (item["size"] as? NSNumber)?.int64Value
+                let lfs = item["lfs"] as? [String: Any]
+                let sha256 = lfs?["oid"] as? String
+                let lfsSize = (lfs?["size"] as? NSNumber)?.int64Value
+                files.append(HubFile(path: path, size: lfsSize ?? size, sha256: sha256))
             }
         }
 
@@ -331,7 +371,14 @@ public class Flux2ModelDownloader: @unchecked Sendable {
     }
 
     /// Download a single file from HuggingFace
-    private func downloadFile(repoId: String, filePath: String, to destination: URL) async throws -> URL {
+    private func downloadFile(repoId: String, filePath: String, to destination: URL,
+                              expectedSize: Int64?, expectedSHA256: String?,
+                              progress: @escaping @Sendable (Int64) -> Void) async throws -> URL {
+        if Self.fileMatches(destination, expectedSize: expectedSize, expectedSHA256: expectedSHA256) {
+            progress(expectedSize ?? Self.fileSize(destination))
+            return destination
+        }
+
         let urlString = "https://huggingface.co/\(repoId)/resolve/main/\(filePath)"
 
         guard let url = URL(string: urlString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? urlString) else {
@@ -343,20 +390,112 @@ public class Flux2ModelDownloader: @unchecked Sendable {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
-        let (tempURL, response) = try await session.download(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw Flux2DownloadError.downloadFailed("Failed to download \(filePath)")
+        let partURL = destination.appendingPathExtension("part")
+        var existingBytes = Self.fileSize(partURL)
+        if existingBytes > 0 {
+            request.setValue("bytes=\(existingBytes)-", forHTTPHeaderField: "Range")
         }
 
-        // Move to destination
+        // Native, chunked download to a system temp file. (URLSession.bytes is an AsyncSequence of
+        // single UInt8 — billions of async iterations for a multi-GB shard, pathologically slow — so
+        // we use session.download instead.) Resume is handled by the Range header + the .part file.
+        let (tempURL, response) = try await session.download(for: request)
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw Flux2DownloadError.downloadFailed("Failed to download \(filePath)")
+        }
+        if existingBytes > 0, httpResponse.statusCode != 206 {
+            // The server ignored the Range and returned the whole file — discard the partial so we
+            // never append a full body onto a partial one (corruption).
+            try? FileManager.default.removeItem(at: partURL)
+            existingBytes = 0
+        }
+        guard httpResponse.statusCode == 200 || httpResponse.statusCode == 206 else {
+            throw Flux2DownloadError.downloadFailed("Failed to download \(filePath): HTTP \(httpResponse.statusCode)")
+        }
+        try Task.checkCancellation()
+
+        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if existingBytes == 0 {
+            // Fresh (or Range-reset) download: the temp file is the whole file.
+            if FileManager.default.fileExists(atPath: partURL.path) { try FileManager.default.removeItem(at: partURL) }
+            try FileManager.default.moveItem(at: tempURL, to: partURL)
+        } else {
+            // Resume (206): append the downloaded suffix to the existing .part.
+            let outHandle = try FileHandle(forWritingTo: partURL)
+            let inHandle = try FileHandle(forReadingFrom: tempURL)
+            defer { try? outHandle.close(); try? inHandle.close() }
+            try outHandle.seekToEnd()
+            while let chunk = try inHandle.read(upToCount: 8 * 1024 * 1024), !chunk.isEmpty {
+                try outHandle.write(contentsOf: chunk)
+            }
+        }
+        progress(Self.fileSize(partURL))
+
+        guard Self.fileMatches(partURL, expectedSize: expectedSize, expectedSHA256: expectedSHA256) else {
+            // Delete the corrupt partial so a retry re-downloads from scratch instead of forever
+            // resuming a bad prefix that fails verification identically.
+            try? FileManager.default.removeItem(at: partURL)
+            throw Flux2DownloadError.downloadFailed("Hash or size verification failed for \(filePath)")
+        }
         if FileManager.default.fileExists(atPath: destination.path) {
             try FileManager.default.removeItem(at: destination)
         }
-        try FileManager.default.moveItem(at: tempURL, to: destination)
+        try FileManager.default.moveItem(at: partURL, to: destination)
 
         return destination
+    }
+
+    private static func writeManifest(_ files: [HubFile], at directory: URL) throws {
+        let manifest = DownloadManifest(files: files.map {
+            DownloadManifest.File(filename: URL(fileURLWithPath: $0.path).lastPathComponent,
+                                  size: $0.size, sha256: $0.sha256)
+        })
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(manifest).write(to: directory.appendingPathComponent(manifestFilename), options: .atomic)
+    }
+
+    private static func verifyManifestIfPresent(at directory: URL, verifyHashes: Bool = false) -> Bool {
+        let url = directory.appendingPathComponent(manifestFilename)
+        // No manifest → this model was downloaded by an older app version, by mflux, or via the HF CLI
+        // cache; none of those write our manifest. Trust the structural verifyModel() that already
+        // passed rather than forcing a multi-GB re-download. Likewise, a present-but-unreadable manifest
+        // is not itself evidence of a bad download — only a readable manifest whose listed files fail.
+        guard FileManager.default.fileExists(atPath: url.path) else { return true }
+        guard let data = try? Data(contentsOf: url),
+              let manifest = try? JSONDecoder().decode(DownloadManifest.self, from: data) else { return true }
+        for file in manifest.files {
+            let path = directory.appendingPathComponent(file.filename)
+            guard fileMatches(path, expectedSize: file.size, expectedSHA256: file.sha256, verifyHash: verifyHashes) else { return false }
+        }
+        return true
+    }
+
+    private static func fileMatches(_ url: URL, expectedSize: Int64?, expectedSHA256: String?, verifyHash: Bool = true) -> Bool {
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+        if let expectedSize, fileSize(url) != expectedSize { return false }
+        if verifyHash, let expectedSHA256, !expectedSHA256.isEmpty {
+            guard (try? sha256Hex(of: url)) == expectedSHA256.lowercased() else { return false }
+        }
+        return true
+    }
+
+    private static func fileSize(_ url: URL) -> Int64 {
+        ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber)?.int64Value ?? 0
+    }
+
+    private static func sha256Hex(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while true {
+            let data = try handle.read(upToCount: 1024 * 1024) ?? Data()
+            if data.isEmpty { break }
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     /// Download all models for a quantization configuration

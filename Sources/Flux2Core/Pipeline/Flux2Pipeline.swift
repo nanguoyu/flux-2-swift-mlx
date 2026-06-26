@@ -34,6 +34,9 @@ public typealias Flux2ProgressCallback = @Sendable (Int, Int) -> Void
 /// Checkpoint callback for saving intermediate images (step, image)
 public typealias Flux2CheckpointCallback = @Sendable (Int, CGImage) -> Void
 
+/// Cooperative cancellation/pause checkpoint supplied by embedding apps.
+public typealias Flux2ControlCheckpoint = @Sendable () throws -> Void
+
 /// Result of image generation including the image and metadata
 public struct Flux2GenerationResult: Sendable {
     /// The generated image
@@ -78,6 +81,14 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// pre-quantized `klein4B_4bit` checkpoint on memory-constrained devices (iPhone) without
     /// changing the on-the-fly quantization path Mac uses for the same precision (nil = auto).
     public let transformerVariantOverride: ModelRegistry.TransformerVariant?
+
+    /// Optional app-supplied checkpoint called at safe generation boundaries.
+    public var controlCheckpoint: Flux2ControlCheckpoint?
+
+    private func checkpoint() throws {
+        try controlCheckpoint?()
+        try Task.checkCancellation()
+    }
 
     /// Memory optimization settings for transformer inference
     public var memoryOptimization: MemoryOptimizationConfig
@@ -816,6 +827,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         onProgress: Flux2ProgressCallback?,
         onCheckpoint: Flux2CheckpointCallback?
     ) async throws -> Flux2GenerationResult {
+        try checkpoint()
         // Validate dimensions
         let (validHeight, validWidth) = LatentUtils.validateDimensions(
             height: height,
@@ -1121,6 +1133,7 @@ public class Flux2Pipeline: @unchecked Sendable {
                 guard let transformer = transformer else {
                     throw Flux2Error.generationCancelled
                 }
+                try checkpoint()
 
                 // Step 0: KV extraction pass
                 let step0Start = Date()
@@ -1148,10 +1161,12 @@ public class Flux2Pipeline: @unchecked Sendable {
                 let step0Duration = Date().timeIntervalSince(step0Start)
                 profiler.recordStep(duration: step0Duration)
                 onProgress?(1, effectiveSteps)
+                try checkpoint()
                 Flux2Debug.log("Step 0 (KV extraction): \(String(format: "%.1f", step0Duration))s, cached \(kvCache.layerCount) layers")
 
                 // Steps 1+: Cached denoising (no reference tokens in input)
                 for stepIdx in 1..<(scheduler.sigmas.count - 1) {
+                    try checkpoint()
                     let stepStart = Date()
                     let sigma = scheduler.sigmas[stepIdx]
                     let t = MLXArray([sigma])
@@ -1180,6 +1195,7 @@ public class Flux2Pipeline: @unchecked Sendable {
                     let stepDuration = Date().timeIntervalSince(stepStart)
                     profiler.recordStep(duration: stepDuration)
                     onProgress?(stepIdx + 1, effectiveSteps)
+                    try checkpoint()
                     Flux2Debug.verbose("Step \(stepIdx + 1)/\(effectiveSteps) (cached)")
 
                     // Checkpoint
@@ -1215,6 +1231,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             // === STANDARD I2I DENOISING PATH ===
 
             for stepIdx in 0..<(scheduler.sigmas.count - 1) {
+                try checkpoint()
                 let stepStart = Date()
 
                 let sigma = scheduler.sigmas[stepIdx]
@@ -1259,6 +1276,7 @@ public class Flux2Pipeline: @unchecked Sendable {
                 profiler.recordStep(duration: stepDuration)
 
                 onProgress?(stepIdx + 1, effectiveSteps)
+                try checkpoint()
                 Flux2Debug.verbose("Step \(stepIdx + 1)/\(effectiveSteps)")
 
                 // Checkpoint
@@ -1297,6 +1315,7 @@ public class Flux2Pipeline: @unchecked Sendable {
 
             // Decode final OUTPUT latents
             profiler.start("7. VAE Decode")
+            try checkpoint()
             var finalPatchified = LatentUtils.unpackSequenceToPatchified(
                 packedOutputLatents,
                 height: validHeight,
@@ -1316,6 +1335,7 @@ public class Flux2Pipeline: @unchecked Sendable {
 
             let decoded = vae!.decode(finalLatents)
             eval(decoded)
+            try checkpoint()
             profiler.end("7. VAE Decode")
 
             profiler.start("8. Post-processing")
@@ -1377,6 +1397,7 @@ public class Flux2Pipeline: @unchecked Sendable {
 
         // Denoising loop - use sigmas (in [0, 1] range) for transformer
         for stepIdx in 0..<(scheduler.sigmas.count - 1) {
+            try checkpoint()
             let stepStart = Date()
 
             let sigma = scheduler.sigmas[stepIdx]
@@ -1418,6 +1439,7 @@ public class Flux2Pipeline: @unchecked Sendable {
 
             // Report progress (using effective steps for I2I)
             onProgress?(stepIdx + 1, effectiveSteps)
+            try checkpoint()
 
             Flux2Debug.verbose("Step \(stepIdx + 1)/\(effectiveSteps)")
 
@@ -1461,6 +1483,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         profiler.end("6. Denoising Loop")
 
         Flux2Debug.log("Denoising complete, decoding image...")
+        try checkpoint()
 
         // Unpack sequence latents back to patchified format [B, 128, H/16, W/16]
         var patchifiedFinal = LatentUtils.unpackSequenceToPatchified(
@@ -1502,6 +1525,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         profiler.start("7. VAE Decode")
         let decoded = vae!.decode(finalLatents)
         eval(decoded)
+        try checkpoint()
         profiler.end("7. VAE Decode")
 
         // Convert to CGImage
@@ -1910,4 +1934,3 @@ extension Flux2Pipeline {
         return missing
     }
 }
-

@@ -5,15 +5,35 @@
 
 import Foundation
 import Hub
+import CryptoKit
 
 /// Progress callback for download updates
 public typealias TextEncoderDownloadProgressCallback = @Sendable (Double, String) -> Void
 
 /// Model downloader with HuggingFace Hub integration
 public class TextEncoderModelDownloader {
+    private struct HubFile: Sendable {
+        var path: String
+        var size: Int64?
+        var sha256: String?
+    }
+
+    private struct DownloadManifest: Codable {
+        struct File: Codable {
+            var filename: String
+            var size: Int64?
+            var sha256: String?
+        }
+        var version: Int = 1
+        var files: [File]
+    }
+
+    private static let manifestFilename = ".mobile-diffuser-download-manifest.json"
 
     /// HuggingFace token for private/gated models
     private var hfToken: String?
+
+    private let session: URLSession
 
     /// Custom override for model storage directory.
     /// Set this before any download/check call to redirect model storage.
@@ -73,6 +93,11 @@ public class TextEncoderModelDownloader {
         if let token = hfToken {
             setenv("HF_TOKEN", token, 1)
         }
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForResource = 3600
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        self.session = URLSession(configuration: config)
     }
 
     /// Check if a model is already downloaded
@@ -322,17 +347,11 @@ public class TextEncoderModelDownloader {
         print("Repository: \(model.repoId)")
         print()
 
-        let modelUrl = try await Self.hubApi.snapshot(
-            from: model.repoId,
-            matching: ["*.json", "*.safetensors", "tokenizer.model"]
-        ) { downloadProgress in
-            let completed = downloadProgress.completedUnitCount
-            let total = downloadProgress.totalUnitCount
-            let fraction = downloadProgress.fractionCompleted
-
-            let message = "Downloading file \(completed)/\(total)"
-            progress?(fraction, message)
-        }
+        let modelUrl = try await downloadResumableSnapshot(
+            repoId: model.repoId,
+            matching: { path in path.hasSuffix(".json") || path.hasSuffix(".safetensors") || path == "tokenizer.model" },
+            progress: progress
+        )
 
         let verification = Self.verifyShardedModel(at: modelUrl)
         if !verification.complete {
@@ -343,6 +362,170 @@ public class TextEncoderModelDownloader {
         print("\nQwen3 download complete: \(modelUrl.path)")
 
         return modelUrl
+    }
+
+    private func downloadResumableSnapshot(
+        repoId: String,
+        matching: @escaping (String) -> Bool,
+        progress: TextEncoderDownloadProgressCallback? = nil
+    ) async throws -> URL {
+        let allFiles = try await fetchHubFiles(repoId: repoId)
+        let files = allFiles.filter { matching($0.path) }
+        guard !files.isEmpty else { throw TextEncoderModelDownloaderError.downloadFailed("No model files found in \(repoId)") }
+
+        var destDir = Self.hubDownloadDirectory
+        for part in repoId.split(separator: "/") { destDir = destDir.appendingPathComponent(String(part)) }
+        try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
+
+        let totalBytes = max(1, files.reduce(Int64(0)) { $0 + ($1.size ?? 0) })
+        var completedBytes: Int64 = 0
+        for file in files {
+            let filename = URL(fileURLWithPath: file.path).lastPathComponent
+            let destination = destDir.appendingPathComponent(filename)
+            if Self.fileMatches(destination, expectedSize: file.size, expectedSHA256: file.sha256) {
+                completedBytes += file.size ?? Self.fileSize(destination)
+                progress?(min(1, Double(completedBytes) / Double(totalBytes)), "Verified \(filename)")
+                continue
+            }
+            let baseBytes = completedBytes
+            try await downloadFile(repoId: repoId, filePath: file.path, to: destination,
+                                   expectedSize: file.size, expectedSHA256: file.sha256) { bytes in
+                progress?(min(1, Double(baseBytes + bytes) / Double(totalBytes)), "Downloading \(filename)")
+            }
+            completedBytes += Self.fileSize(destination)
+        }
+        try Self.writeManifest(files, at: destDir)
+        return destDir
+    }
+
+    private func fetchHubFiles(repoId: String) async throws -> [HubFile] {
+        let urlString = "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=1&expand=1"
+        guard let url = URL(string: urlString) else {
+            throw TextEncoderModelDownloaderError.downloadFailed("Invalid URL: \(urlString)")
+        }
+        var request = URLRequest(url: url)
+        if let token = hfToken { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw TextEncoderModelDownloaderError.downloadFailed("Could not list files for \(repoId)")
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw TextEncoderModelDownloaderError.downloadFailed("Invalid file list for \(repoId)")
+        }
+        return json.compactMap { item in
+            guard (item["type"] as? String) == "file", let path = item["path"] as? String else { return nil }
+            let size = (item["size"] as? NSNumber)?.int64Value
+            let lfs = item["lfs"] as? [String: Any]
+            let sha256 = lfs?["oid"] as? String
+            let lfsSize = (lfs?["size"] as? NSNumber)?.int64Value
+            return HubFile(path: path, size: lfsSize ?? size, sha256: sha256)
+        }
+    }
+
+    private func downloadFile(repoId: String, filePath: String, to destination: URL,
+                              expectedSize: Int64?, expectedSHA256: String?,
+                              progress: @escaping @Sendable (Int64) -> Void) async throws {
+        if Self.fileMatches(destination, expectedSize: expectedSize, expectedSHA256: expectedSHA256) {
+            progress(expectedSize ?? Self.fileSize(destination)); return
+        }
+        let urlString = "https://huggingface.co/\(repoId)/resolve/main/\(filePath)"
+        guard let url = URL(string: urlString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? urlString) else {
+            throw TextEncoderModelDownloaderError.downloadFailed("Invalid URL: \(urlString)")
+        }
+        var request = URLRequest(url: url)
+        if let token = hfToken { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        let partURL = destination.appendingPathExtension("part")
+        var existingBytes = Self.fileSize(partURL)
+        if existingBytes > 0 { request.setValue("bytes=\(existingBytes)-", forHTTPHeaderField: "Range") }
+
+        // Native chunked download to a temp file (URLSession.bytes' per-UInt8 AsyncSequence is far too
+        // slow for multi-GB encoder shards). Resume is handled via the Range header + the .part file.
+        let (tempURL, response) = try await session.download(for: request)
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        guard let http = response as? HTTPURLResponse else {
+            throw TextEncoderModelDownloaderError.downloadFailed("Invalid response for \(filePath)")
+        }
+        if existingBytes > 0, http.statusCode != 206 {
+            // Server ignored the Range and sent the full file — discard the partial to avoid corruption.
+            try? FileManager.default.removeItem(at: partURL)
+            existingBytes = 0
+        }
+        guard http.statusCode == 200 || http.statusCode == 206 else {
+            throw TextEncoderModelDownloaderError.downloadFailed("HTTP \(http.statusCode) for \(filePath)")
+        }
+        try Task.checkCancellation()
+        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if existingBytes == 0 {
+            if FileManager.default.fileExists(atPath: partURL.path) { try FileManager.default.removeItem(at: partURL) }
+            try FileManager.default.moveItem(at: tempURL, to: partURL)
+        } else {
+            let outHandle = try FileHandle(forWritingTo: partURL)
+            let inHandle = try FileHandle(forReadingFrom: tempURL)
+            defer { try? outHandle.close(); try? inHandle.close() }
+            try outHandle.seekToEnd()
+            while let chunk = try inHandle.read(upToCount: 8 * 1024 * 1024), !chunk.isEmpty {
+                try outHandle.write(contentsOf: chunk)
+            }
+        }
+        progress(Self.fileSize(partURL))
+        guard Self.fileMatches(partURL, expectedSize: expectedSize, expectedSHA256: expectedSHA256) else {
+            // Remove the corrupt partial so a retry re-downloads from scratch, not the same bad prefix.
+            try? FileManager.default.removeItem(at: partURL)
+            throw TextEncoderModelDownloaderError.downloadFailed("Hash or size verification failed for \(filePath)")
+        }
+        if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
+        try FileManager.default.moveItem(at: partURL, to: destination)
+    }
+
+    private static func writeManifest(_ files: [HubFile], at directory: URL) throws {
+        let manifest = DownloadManifest(files: files.map {
+            DownloadManifest.File(filename: URL(fileURLWithPath: $0.path).lastPathComponent,
+                                  size: $0.size, sha256: $0.sha256)
+        })
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(manifest).write(to: directory.appendingPathComponent(manifestFilename), options: .atomic)
+    }
+
+    private static func verifyManifestIfPresent(at directory: URL, verifyHashes: Bool = false) -> Bool {
+        let url = directory.appendingPathComponent(manifestFilename)
+        // No manifest (older app version, mflux, HF CLI cache) or an unreadable one is not evidence of
+        // a bad download — trust the structural check rather than forcing a multi-GB re-download. Only a
+        // readable manifest whose listed files fail size/hash means the download is actually incomplete.
+        guard FileManager.default.fileExists(atPath: url.path) else { return true }
+        guard let data = try? Data(contentsOf: url),
+              let manifest = try? JSONDecoder().decode(DownloadManifest.self, from: data) else { return true }
+        for file in manifest.files {
+            guard fileMatches(directory.appendingPathComponent(file.filename), expectedSize: file.size, expectedSHA256: file.sha256, verifyHash: verifyHashes) else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func fileMatches(_ url: URL, expectedSize: Int64?, expectedSHA256: String?, verifyHash: Bool = true) -> Bool {
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+        if let expectedSize, fileSize(url) != expectedSize { return false }
+        if verifyHash, let expectedSHA256, !expectedSHA256.isEmpty {
+            guard (try? sha256Hex(of: url)) == expectedSHA256.lowercased() else { return false }
+        }
+        return true
+    }
+
+    private static func fileSize(_ url: URL) -> Int64 {
+        ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber)?.int64Value ?? 0
+    }
+
+    private static func sha256Hex(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while true {
+            let data = try handle.read(upToCount: 1024 * 1024) ?? Data()
+            if data.isEmpty { break }
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     /// Download a Qwen3 model by variant
@@ -368,7 +551,7 @@ public class TextEncoderModelDownloader {
         if FileManager.default.fileExists(atPath: newPath.appendingPathComponent("config.json").path) {
             // Verify safetensors files are complete
             let verification = verifyShardedModel(at: newPath)
-            if verification.complete {
+            if verification.complete && verifyManifestIfPresent(at: newPath) {
                 return newPath
             }
         }
@@ -394,7 +577,7 @@ public class TextEncoderModelDownloader {
         if FileManager.default.fileExists(atPath: configPath.path) {
             // Verify safetensors files are complete
             let verification = verifyShardedModel(at: modelPath)
-            if verification.complete {
+            if verification.complete && verifyManifestIfPresent(at: modelPath) {
                 return modelPath
             }
         }
@@ -421,7 +604,7 @@ public class TextEncoderModelDownloader {
         if FileManager.default.fileExists(atPath: newPath.appendingPathComponent("config.json").path) {
             // Verify safetensors files are complete
             let verification = verifyShardedModel(at: newPath)
-            if verification.complete {
+            if verification.complete && verifyManifestIfPresent(at: newPath) {
                 return newPath
             }
         }
@@ -447,7 +630,7 @@ public class TextEncoderModelDownloader {
         if FileManager.default.fileExists(atPath: configPath.path) {
             // Verify safetensors files are complete
             let verification = verifyShardedModel(at: modelPath)
-            if verification.complete {
+            if verification.complete && verifyManifestIfPresent(at: modelPath) {
                 return modelPath
             }
         }
