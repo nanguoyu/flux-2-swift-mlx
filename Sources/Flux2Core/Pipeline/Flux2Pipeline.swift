@@ -107,20 +107,16 @@ public class Flux2Pipeline: @unchecked Sendable {
         #endif
     }
 
-    /// Decode the final latent, tiling only on iPhone at >=1024 px. The Flux.2 VAE's mid-block
-    /// self-attention is dense over the full spatial map (a ~1.07 GB fp32 transient at 1024), and it
-    /// fires right after a long, hot denoise — exactly the worst moment for a memory/power spike.
-    /// Tiling decomposes that into bounded 32-latent tiles. Below 1024 (latent <128) the latent is
-    /// small enough that `decodeWithTiling` falls through to a plain full decode, so 512 stays on the
-    /// exact same code path. Mac always decodes untiled (plugged in, has the headroom).
+    /// Decode the final latent (untiled). The Flux.2 VAE's mid-block self-attention is dense over the
+    /// full spatial map (a ~1.07 GB fp32 transient at 1024) right after a long, hot denoise, but the
+    /// spatial-tiling path (`decodeTiled`) is numerically broken — clamped edge tiles give a
+    /// non-uniform overlap, yielding a wrong-sized (1152 vs 1024) seamed image — and spatial tiling is
+    /// inherently seam-prone through GroupNorm / conv receptive fields. So decode full-frame; the
+    /// iPhone 1024 path streams the transformer (freed before decode), giving the decode headroom. If
+    /// the spike still OOMs on-device, the correct fix is exact online-softmax chunking of that
+    /// attention, not seam-prone spatial tiling.
     private func decodeForDevice(_ finalLatents: MLXArray) -> MLXArray {
-        #if os(iOS)
-        if finalLatents.shape[2] >= 128 || finalLatents.shape[3] >= 128 {
-            // overlap:4 (.aggressive). If on-device 1024 shows tile seams, bump to overlap:8.
-            return vae!.decodeWithTiling(finalLatents, tiling: .aggressive)
-        }
-        #endif
-        return vae!.decode(finalLatents)
+        vae!.decode(finalLatents)
     }
 
     /// Memory optimization settings for transformer inference
