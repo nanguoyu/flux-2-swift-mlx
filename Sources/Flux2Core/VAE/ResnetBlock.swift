@@ -303,8 +303,29 @@ public class AttentionBlock: Module, @unchecked Sendable {
 
         // Attention
         let scale = Float(1.0 / sqrt(Float(C)))
-        let attnWeights = softmax(matmul(q, k) * scale, axis: -1)
-        let attnOut = matmul(attnWeights, v)  // [B, HW, C]
+        let HW = H * W
+        let attnOut: MLXArray
+        if HW > 4096 {
+            // Query-CHUNKED attention for large spatial maps (e.g. the 128×128 mid-block at 1024).
+            // Each query row's softmax is over ALL keys independently, so chunking the query dimension
+            // is numerically EXACT (no online-softmax). The materialized score tile shrinks from the
+            // full [HW, HW] (~1.07 GB at 1024) to [chunk, HW] (~67 MB) — killing the decode memory/power
+            // spike. MLX frees each chunk's scores after its output, so peak stays at one chunk.
+            let numChunks = max(1, HW / 1024)
+            let chunkSize = (HW + numChunks - 1) / numChunks
+            var outs: [MLXArray] = []
+            var start = 0
+            while start < HW {
+                let end = Swift.min(start + chunkSize, HW)
+                let qc = q[0..., start ..< end, 0...]                 // [B, chunk, C]
+                let sc = softmax(matmul(qc, k) * scale, axis: -1)     // [B, chunk, HW]
+                outs.append(matmul(sc, v))                           // [B, chunk, C]
+                start = end
+            }
+            attnOut = concatenated(outs, axis: 1)
+        } else {
+            attnOut = matmul(softmax(matmul(q, k) * scale, axis: -1), v)  // [B, HW, C]
+        }
 
         // Project output
         hidden = toOut(attnOut)
