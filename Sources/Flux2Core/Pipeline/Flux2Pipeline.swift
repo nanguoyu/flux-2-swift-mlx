@@ -37,6 +37,9 @@ public typealias Flux2CheckpointCallback = @Sendable (Int, CGImage) -> Void
 /// Cooperative cancellation/pause checkpoint supplied by embedding apps.
 public typealias Flux2ControlCheckpoint = @Sendable () throws -> Void
 
+/// Per-step thermal pacing supplied by embedding apps (iOS). Awaited each denoise step.
+public typealias Flux2ThermalThrottle = @Sendable () async throws -> Void
+
 /// Result of image generation including the image and metadata
 public struct Flux2GenerationResult: Sendable {
     /// The generated image
@@ -85,9 +88,39 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// Optional app-supplied checkpoint called at safe generation boundaries.
     public var controlCheckpoint: Flux2ControlCheckpoint?
 
+    /// Optional app-supplied thermal pacing, awaited once per denoise step on the resident (iOS)
+    /// path. On a cool device or macOS it is a no-op; on a hot phone it inserts cooperative sleeps or
+    /// a cooling pause so a sustained run slows or pauses to cool rather than tripping an OS thermal
+    /// shutdown. Kept separate from `controlCheckpoint` (which is the synchronous cancel/pause hook)
+    /// because thermal pacing must be able to `await` without blocking a cooperative-pool thread.
+    public var thermalThrottle: Flux2ThermalThrottle?
+
     private func checkpoint() throws {
         try controlCheckpoint?()
         try Task.checkCancellation()
+    }
+
+    /// Per-step thermal pacing. iOS-only; the Mac path never sleeps (byte-for-byte unchanged).
+    private func paceThermally() async throws {
+        #if os(iOS)
+        try await thermalThrottle?()
+        #endif
+    }
+
+    /// Decode the final latent, tiling only on iPhone at >=1024 px. The Flux.2 VAE's mid-block
+    /// self-attention is dense over the full spatial map (a ~1.07 GB fp32 transient at 1024), and it
+    /// fires right after a long, hot denoise — exactly the worst moment for a memory/power spike.
+    /// Tiling decomposes that into bounded 32-latent tiles. Below 1024 (latent <128) the latent is
+    /// small enough that `decodeWithTiling` falls through to a plain full decode, so 512 stays on the
+    /// exact same code path. Mac always decodes untiled (plugged in, has the headroom).
+    private func decodeForDevice(_ finalLatents: MLXArray) -> MLXArray {
+        #if os(iOS)
+        if finalLatents.shape[2] >= 128 || finalLatents.shape[3] >= 128 {
+            // overlap:4 (.aggressive). If on-device 1024 shows tile seams, bump to overlap:8.
+            return vae!.decodeWithTiling(finalLatents, tiling: .aggressive)
+        }
+        #endif
+        return vae!.decode(finalLatents)
     }
 
     /// Memory optimization settings for transformer inference
@@ -1162,6 +1195,7 @@ public class Flux2Pipeline: @unchecked Sendable {
                 profiler.recordStep(duration: step0Duration)
                 onProgress?(1, effectiveSteps)
                 try checkpoint()
+                try await paceThermally()
                 Flux2Debug.log("Step 0 (KV extraction): \(String(format: "%.1f", step0Duration))s, cached \(kvCache.layerCount) layers")
 
                 // Steps 1+: Cached denoising (no reference tokens in input)
@@ -1196,6 +1230,7 @@ public class Flux2Pipeline: @unchecked Sendable {
                     profiler.recordStep(duration: stepDuration)
                     onProgress?(stepIdx + 1, effectiveSteps)
                     try checkpoint()
+                    try await paceThermally()
                     Flux2Debug.verbose("Step \(stepIdx + 1)/\(effectiveSteps) (cached)")
 
                     // Checkpoint
@@ -1277,6 +1312,7 @@ public class Flux2Pipeline: @unchecked Sendable {
 
                 onProgress?(stepIdx + 1, effectiveSteps)
                 try checkpoint()
+                try await paceThermally()
                 Flux2Debug.verbose("Step \(stepIdx + 1)/\(effectiveSteps)")
 
                 // Checkpoint
@@ -1333,7 +1369,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             unloadTransformer()   // free the ~2.18GB transformer before decode (see the T2I site)
             #endif
 
-            let decoded = vae!.decode(finalLatents)
+            let decoded = decodeForDevice(finalLatents)
             eval(decoded)
             try checkpoint()
             profiler.end("7. VAE Decode")
@@ -1440,6 +1476,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             // Report progress (using effective steps for I2I)
             onProgress?(stepIdx + 1, effectiveSteps)
             try checkpoint()
+            try await paceThermally()
 
             Flux2Debug.verbose("Step \(stepIdx + 1)/\(effectiveSteps)")
 
@@ -1523,7 +1560,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         MemoryConfig.applyCacheLimit(bytes: phaseLimits.vaeDecoding)
 
         profiler.start("7. VAE Decode")
-        let decoded = vae!.decode(finalLatents)
+        let decoded = decodeForDevice(finalLatents)
         eval(decoded)
         try checkpoint()
         profiler.end("7. VAE Decode")
