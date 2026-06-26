@@ -352,6 +352,10 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
     public var doubleStreamBlockCount: Int { transformerBlocks.count }
     public var singleStreamBlockCount: Int { singleTransformerBlocks.count }
 
+    /// Individual block access for the streaming denoiser's resident-mode adapters and parity tests.
+    public func doubleStreamBlock(_ i: Int) -> Flux2TransformerBlock { transformerBlocks[i] }
+    public func singleStreamBlock(_ i: Int) -> Flux2SingleTransformerBlock { singleTransformerBlocks[i] }
+
     /// Embed phase (mirror of the projection/temb/rope/modulation prologue in `callAsFunction`).
     /// Returns the packed `[txt ; img]` hidden state plus the per-step context the blocks read.
     public func streamEmbed(hiddenStates: MLXArray, encoderHiddenStates: MLXArray,
