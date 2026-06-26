@@ -326,6 +326,81 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
         return output
     }
 
+    // MARK: - Block-Streaming Decomposition
+    //
+    // These expose `callAsFunction`'s exact phases so a denoiser can stream ONE transformer block at
+    // a time (load → run → release) instead of holding all 25 resident — the only way FLUX.2 1024
+    // fits an iPhone's memory budget. The per-block run helpers are `static` and take the block
+    // instance, so the SAME split/rejoin logic runs whether the block comes from this resident model
+    // (the parity test) or a freshly-loaded streaming instance (the engine adapter). `callAsFunction`
+    // is deliberately left untouched, so the validated resident (Mac) path stays byte-for-byte; a
+    // unit test asserts this decomposition reproduces `callAsFunction` to fp tolerance on random
+    // weights (catching the textSeqLen split off-by-one without needing the real checkpoint).
+
+    /// Resident-phase tensors a streamed step computes once in `streamEmbed` and threads to every
+    /// block run and to `streamUnembed`. The packed hidden state is `[txt ; img]` on axis 1 (TXT
+    /// FIRST, matching the RoPE id order), split at `textSeqLen`.
+    public struct Flux2StreamContext {
+        public let temb: MLXArray
+        public let rope: (cos: MLXArray, sin: MLXArray)
+        public let imgMod: [ModulationParams]
+        public let txtMod: [ModulationParams]
+        public let singleMod: [ModulationParams]
+        public let textSeqLen: Int
+    }
+
+    public var doubleStreamBlockCount: Int { transformerBlocks.count }
+    public var singleStreamBlockCount: Int { singleTransformerBlocks.count }
+
+    /// Embed phase (mirror of the projection/temb/rope/modulation prologue in `callAsFunction`).
+    /// Returns the packed `[txt ; img]` hidden state plus the per-step context the blocks read.
+    public func streamEmbed(hiddenStates: MLXArray, encoderHiddenStates: MLXArray,
+                            timestep: MLXArray, guidance: MLXArray? = nil,
+                            imgIds: MLXArray, txtIds: MLXArray)
+        -> (hidden: MLXArray, context: Flux2StreamContext) {
+        let imgHS = xEmbedder(hiddenStates)
+        let txtHS = contextEmbedder(encoderHiddenStates)
+        // Same 1000× scaling the monolithic forward applies before the sinusoidal time embedding.
+        let scaledTimestep = timestep * 1000
+        let scaledGuidance = guidance.map { $0 * 1000 }
+        let temb = timeGuidanceEmbed(timestep: scaledTimestep, guidance: scaledGuidance)
+        let ropeEmb = posEmbed(concatenated([txtIds, imgIds], axis: 0))
+        let imgMod = doubleStreamModulationImg(temb)
+        let txtMod = doubleStreamModulationTxt(temb)
+        let singleMod = singleStreamModulation(temb)
+        let textSeqLen = txtHS.shape[1]
+        let hidden = concatenated([txtHS, imgHS], axis: 1)
+        return (hidden, Flux2StreamContext(temb: temb, rope: ropeEmb, imgMod: imgMod,
+                                           txtMod: txtMod, singleMod: singleMod, textSeqLen: textSeqLen))
+    }
+
+    /// Run one double-stream block on packed `[txt ; img]` hidden: split at `textSeqLen`, run with the
+    /// separate img/txt streams (exactly as the monolithic loop), rejoin `[newTxt ; newImg]`. Concat
+    /// then split at the same index is a lossless round-trip, so this is numerically identical to the
+    /// monolithic path that keeps the streams separate across all double blocks.
+    public static func runDouble(_ block: Flux2TransformerBlock, hidden: MLXArray,
+                                 context ctx: Flux2StreamContext) -> MLXArray {
+        let txt = hidden[0..., 0 ..< ctx.textSeqLen, 0...]
+        let img = hidden[0..., ctx.textSeqLen..., 0...]
+        let out = block(hiddenStates: img, encoderHiddenStates: txt, temb: ctx.temb,
+                        rotaryEmb: ctx.rope, imgModParams: ctx.imgMod, txtModParams: ctx.txtMod)
+        return concatenated([out.encoderHiddenStates, out.hiddenStates], axis: 1)
+    }
+
+    /// Run one single-stream block on the packed `[txt ; img]` hidden (already concatenated).
+    public static func runSingle(_ block: Flux2SingleTransformerBlock, hidden: MLXArray,
+                                 context ctx: Flux2StreamContext) -> MLXArray {
+        block(hiddenStates: hidden, encoderHiddenStates: nil, temb: ctx.temb,
+              rotaryEmb: ctx.rope, modParams: ctx.singleMod)
+    }
+
+    /// Unembed phase (mirror of the slice → final-norm → projection epilogue in `callAsFunction`).
+    public func streamUnembed(hidden: MLXArray, context ctx: Flux2StreamContext) -> MLXArray {
+        var imgHS = hidden[0..., ctx.textSeqLen..., 0...]
+        imgHS = normOut(imgHS, conditioning: ctx.temb)
+        return projOut(imgHS)
+    }
+
     // MARK: - KV-Cached Forward Passes (for klein-9b-kv)
 
     /// KV extraction forward pass (step 0 of KV-cached denoising)
