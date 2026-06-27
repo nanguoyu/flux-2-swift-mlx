@@ -93,6 +93,10 @@ public class VAEDecoder: Module, @unchecked Sendable {
     /// lower-res stages stay below it and keep MLX's lazy fusion (no sync cost).
     private static let heavyHW = 512 * 512
 
+    /// Decode-time conv striping (see `stripedConv`). Public so tools can flip it OFF to capture a
+    /// full-frame reference and prove the striped decode is bit-identical. Production = on.
+    nonisolated(unsafe) public static var stripeHeavyConvs = true
+
     public func callAsFunction(_ z: MLXArray) -> MLXArray {
         // z shape: [B, latent_channels, H/8, W/8] (NCHW from transformer)
         // Convert to NHWC for MLX Conv2d
@@ -107,46 +111,79 @@ public class VAEDecoder: Module, @unchecked Sendable {
         hidden = midBlock.resnet2(hidden)
         eval(hidden)
 
-        // Up blocks. At full resolution a single ResNet block holds norm1(fp32 upcast) + conv1 im2col +
-        // norm2(fp32) + conv2 im2col ALL alive until the block output is evaluated — ~10GB at 1024². The
-        // heavy blocks are inlined (`decodeResBlock`) so each op's scratch is freed before the next runs,
-        // bounding the peak to ~one op (~2GB). Seam-free (full-frame, so GroupNorm's global spatial stats
-        // are intact — spatial TILING would seam here) and bit-identical (eval only forces evaluation).
+        // Up blocks. At full resolution the cost is a SINGLE op: one 3×3 conv's im2col temporary is
+        // ~7GB at 1024² (e.g. the 192→96 conv) — eval can't shrink it, so the heavy convs are run in
+        // horizontal strips (`decodeConv`/`stripedConv`, exact via a 1-row halo) and each op's scratch
+        // is materialized before the next. Seam-free: GroupNorm's global spatial stats stay full-frame
+        // (spatial TILING would seam there); only the spatially-local convs are split.
         for (resBlocks, upsample) in upBlocks {
             for resBlock in resBlocks {
                 hidden = decodeResBlock(resBlock, hidden)
             }
             if let us = upsample {
-                hidden = us(hidden)
+                hidden = decodeConv(us.conv, us.upsampleNearest(hidden))
                 eval(hidden)
             }
         }
 
-        // Output: the final GroupNorm + conv run at full resolution too — free the norm's fp32 scratch
-        // before the convOut im2col, and the im2col before the transpose.
+        // Output: GroupNorm stays full-frame (global stats); the final conv is striped like the rest.
         hidden = convNormOut(hidden)
         hidden = silu(hidden)
         if (hidden.shape[1] * hidden.shape[2]) >= Self.heavyHW { eval(hidden) }
-        hidden = convOut(hidden)
-        if (hidden.shape[1] * hidden.shape[2]) >= Self.heavyHW { eval(hidden) }
+        hidden = decodeConv(convOut, hidden)
 
         // Convert back to NCHW for output: [B, H, W, 3] -> [B, 3, H, W]
         return hidden.transposed(0, 3, 1, 2)
     }
 
-    /// One decoder ResNet block, materializing each heavy op's scratch so it frees before the next runs.
-    /// Inlines the block's submodules (rather than calling `ResnetBlock2D.callAsFunction`) so the eval
-    /// barriers stay OUT of the encode/training path, where an eval inside a differentiated forward would
-    /// break autograd. Below `heavyHW` it falls through to the plain block (lazy fusion, no sync cost).
-    /// Bit-identical to the plain block — eval only forces evaluation, it doesn't change values.
+    /// One decoder ResNet block at full resolution, with each heavy conv striped and each op's scratch
+    /// materialized so it frees before the next runs. Inlines the block's submodules (rather than
+    /// `ResnetBlock2D.callAsFunction`) so the eval barriers stay OUT of the encode/training path, where
+    /// an eval inside a differentiated forward would break autograd. Below `heavyHW` it falls through to
+    /// the plain block. Bit-identical to the plain block.
     private func decodeResBlock(_ block: ResnetBlock2D, _ x: MLXArray) -> MLXArray {
         guard (x.shape[1] * x.shape[2]) >= Self.heavyHW else { return block(x) }
         var h = silu(block.norm1(x)); eval(h)
-        h = block.conv1(h); eval(h)
+        h = decodeConv(block.conv1, h)
         h = silu(block.norm2(h)); eval(h)
-        h = block.conv2(h); eval(h)
+        h = decodeConv(block.conv2, h)
         let shortcut = block.convShortcut.map { $0(x) } ?? x
         h = h + shortcut; eval(h)
         return h
+    }
+
+    /// Run a stride-1 3×3 padding-1 conv. Full-frame below `heavyHW` or when striping is disabled;
+    /// otherwise striped into ~128-row horizontal bands.
+    private func decodeConv(_ conv: Conv2d, _ x: MLXArray) -> MLXArray {
+        let big = (x.shape[1] * x.shape[2]) >= Self.heavyHW
+        guard big && Self.stripeHeavyConvs else { return conv(x) }
+        return stripedConv(conv, x, strips: Swift.max(1, x.shape[1] / 128))
+    }
+
+    /// Compute a stride-1, 3×3, padding-1 conv in horizontal strips with a 1-row halo, so the im2col
+    /// temporary is bounded to one strip instead of the full-resolution map (~7GB at 1024²). EXACT: the
+    /// 3×3 receptive field reaches exactly 1 row beyond each output row, so feeding rows [a-1 … b+1] and
+    /// cropping the halo output row(s) reproduces the full conv bit-for-bit — and the true top/bottom
+    /// image edges keep the conv's own zero-pad (the strip there starts/ends at the real edge). Only
+    /// valid for the decoder's stride-1 3×3 padding-1 convs.
+    private func stripedConv(_ conv: Conv2d, _ x: MLXArray, strips: Int) -> MLXArray {
+        guard strips > 1 else { return conv(x) }
+        let H = x.shape[1]
+        let stripH = (H + strips - 1) / strips
+        var outs: [MLXArray] = []
+        var a = 0
+        while a < H {
+            let b = Swift.min(a + stripH, H) - 1          // this strip emits output rows [a ... b]
+            let inStart = Swift.max(0, a - 1)             // include 1 halo row above (unless top edge)
+            let inEnd = Swift.min(H, b + 2)               // exclusive; 1 halo row below + 1 for exclusivity
+            let strip = x[0..., inStart ..< inEnd, 0..., 0...]
+            let convd = conv(strip)                        // padding=1 → same row count as `strip`
+            let cropTop = a - inStart                      // 1 for interior strips, 0 at the true top edge
+            let outStrip = convd[0..., cropTop ..< (cropTop + (b - a + 1)), 0..., 0...]
+            eval(outStrip)
+            outs.append(outStrip)
+            a = b + 1
+        }
+        return concatenated(outs, axis: 1)
     }
 }
