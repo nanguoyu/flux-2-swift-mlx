@@ -100,14 +100,21 @@ public class VAEDecoder: Module, @unchecked Sendable {
         hidden = midBlock.resnet1(hidden)
         hidden = midBlock.attention(hidden)
         hidden = midBlock.resnet2(hidden)
+        // Materialize per stage so MLX frees the PRIOR stage's feature maps instead of holding the whole
+        // decoder graph's intermediates at once — bounds the 1024 decode peak to ~the largest single
+        // stage (~13GB whole-graph -> a few GB). Value-preserving (eval only forces evaluation), so the
+        // output is bit-identical; the cost is a few GPU sync barriers.
+        eval(hidden)
 
         // Up blocks
         for (resBlocks, upsample) in upBlocks {
             for resBlock in resBlocks {
                 hidden = resBlock(hidden)
+                eval(hidden)
             }
             if let us = upsample {
                 hidden = us(hidden)
+                eval(hidden)
             }
         }
 
