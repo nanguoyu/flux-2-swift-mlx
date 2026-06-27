@@ -229,7 +229,9 @@ public class Upsample2D: Module, @unchecked Sendable {
         )
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    /// Nearest-neighbor 2× upsample WITHOUT the trailing conv. Exposed so the VAE decoder can run the
+    /// (memory-heavy, full-resolution) conv in strips: `callAsFunction` == `conv(upsampleNearest(x))`.
+    public func upsampleNearest(_ x: MLXArray) -> MLXArray {
         // x shape: [B, H, W, C] (NHWC format for MLX)
         let shape = x.shape
         let B = shape[0]
@@ -237,22 +239,16 @@ public class Upsample2D: Module, @unchecked Sendable {
         let W = shape[2]
         let C = shape[3]
 
-        // Upsample by 2x using nearest neighbor interpolation
-        // The correct approach is to expand dimensions and then reshape:
+        // Upsample by 2x using nearest neighbor interpolation:
         // [B, H, W, C] -> [B, H, 1, W, 1, C] -> broadcast to [B, H, 2, W, 2, C] -> [B, H*2, W*2, C]
-
-        // Reshape to add extra dimensions for broadcasting
         var upsampled = x.reshaped([B, H, 1, W, 1, C])
-
-        // Tile/broadcast to duplicate each element along H and W
-        // Use concatenation to duplicate along each new axis
         upsampled = concatenated([upsampled, upsampled], axis: 2)  // [B, H, 2, W, 1, C]
         upsampled = concatenated([upsampled, upsampled], axis: 4)  // [B, H, 2, W, 2, C]
+        return upsampled.reshaped([B, H * 2, W * 2, C])
+    }
 
-        // Reshape to merge the duplicated dimensions
-        upsampled = upsampled.reshaped([B, H * 2, W * 2, C])
-
-        return conv(upsampled)
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        conv(upsampleNearest(x))
     }
 }
 
