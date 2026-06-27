@@ -88,6 +88,11 @@ public class VAEDecoder: Module, @unchecked Sendable {
         )
     }
 
+    /// Spatial-area threshold above which the decode materializes each heavy op individually. Catches
+    /// the 512² and 1024² decoder stages (where a single conv's im2col temporary is ~1.7GB in fp16);
+    /// lower-res stages stay below it and keep MLX's lazy fusion (no sync cost).
+    private static let heavyHW = 512 * 512
+
     public func callAsFunction(_ z: MLXArray) -> MLXArray {
         // z shape: [B, latent_channels, H/8, W/8] (NCHW from transformer)
         // Convert to NHWC for MLX Conv2d
@@ -100,17 +105,16 @@ public class VAEDecoder: Module, @unchecked Sendable {
         hidden = midBlock.resnet1(hidden)
         hidden = midBlock.attention(hidden)
         hidden = midBlock.resnet2(hidden)
-        // Materialize per stage so MLX frees the PRIOR stage's feature maps instead of holding the whole
-        // decoder graph's intermediates at once — bounds the 1024 decode peak to ~the largest single
-        // stage (~13GB whole-graph -> a few GB). Value-preserving (eval only forces evaluation), so the
-        // output is bit-identical; the cost is a few GPU sync barriers.
         eval(hidden)
 
-        // Up blocks
+        // Up blocks. At full resolution a single ResNet block holds norm1(fp32 upcast) + conv1 im2col +
+        // norm2(fp32) + conv2 im2col ALL alive until the block output is evaluated — ~10GB at 1024². The
+        // heavy blocks are inlined (`decodeResBlock`) so each op's scratch is freed before the next runs,
+        // bounding the peak to ~one op (~2GB). Seam-free (full-frame, so GroupNorm's global spatial stats
+        // are intact — spatial TILING would seam here) and bit-identical (eval only forces evaluation).
         for (resBlocks, upsample) in upBlocks {
             for resBlock in resBlocks {
-                hidden = resBlock(hidden)
-                eval(hidden)
+                hidden = decodeResBlock(resBlock, hidden)
             }
             if let us = upsample {
                 hidden = us(hidden)
@@ -118,12 +122,31 @@ public class VAEDecoder: Module, @unchecked Sendable {
             }
         }
 
-        // Output
+        // Output: the final GroupNorm + conv run at full resolution too — free the norm's fp32 scratch
+        // before the convOut im2col, and the im2col before the transpose.
         hidden = convNormOut(hidden)
         hidden = silu(hidden)
+        if (hidden.shape[1] * hidden.shape[2]) >= Self.heavyHW { eval(hidden) }
         hidden = convOut(hidden)
+        if (hidden.shape[1] * hidden.shape[2]) >= Self.heavyHW { eval(hidden) }
 
         // Convert back to NCHW for output: [B, H, W, 3] -> [B, 3, H, W]
         return hidden.transposed(0, 3, 1, 2)
+    }
+
+    /// One decoder ResNet block, materializing each heavy op's scratch so it frees before the next runs.
+    /// Inlines the block's submodules (rather than calling `ResnetBlock2D.callAsFunction`) so the eval
+    /// barriers stay OUT of the encode/training path, where an eval inside a differentiated forward would
+    /// break autograd. Below `heavyHW` it falls through to the plain block (lazy fusion, no sync cost).
+    /// Bit-identical to the plain block — eval only forces evaluation, it doesn't change values.
+    private func decodeResBlock(_ block: ResnetBlock2D, _ x: MLXArray) -> MLXArray {
+        guard (x.shape[1] * x.shape[2]) >= Self.heavyHW else { return block(x) }
+        var h = silu(block.norm1(x)); eval(h)
+        h = block.conv1(h); eval(h)
+        h = silu(block.norm2(h)); eval(h)
+        h = block.conv2(h); eval(h)
+        let shortcut = block.convShortcut.map { $0(x) } ?? x
+        h = h + shortcut; eval(h)
+        return h
     }
 }
