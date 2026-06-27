@@ -171,84 +171,71 @@ public class AutoencoderKLFlux2: Module, @unchecked Sendable {
         return decodeTiled(z, tileSize: config.tileSize, overlap: config.tileOverlap)
     }
 
-    /// Tiled decoding implementation with overlap cropping
-    /// Decodes large latents in tiles and concatenates results
+    /// Tiled decoding (blend-accumulate). Decodes the latent in overlapping spatial tiles and blends
+    /// them into a full-size accumulator with boundary-aware feathered weights. This bounds the peak to
+    /// ~ONE tile's decode (the decoder's high-res feature maps are the 1024 memory wall, ~8.7GB full),
+    /// yields the EXACTLY correct output size (the old fixed-overlap crop gave 1152px on clamped edge
+    /// tiles), and feathers only interior edges so the image border isn't divided by a near-zero weight.
     private func decodeTiled(_ z: MLXArray, tileSize: Int, overlap: Int) -> MLXArray {
-        let H = z.shape[2]
-        let W = z.shape[3]
+        let scale = 8
+        let H = z.shape[2], W = z.shape[3]
+        let outH = H * scale, outW = W * scale
+        let stride = Swift.max(1, tileSize - overlap)
 
-        let outOverlap = overlap * 8
-        let stride = tileSize - overlap
+        func starts(_ total: Int) -> [Int] {
+            if total <= tileSize { return [0] }
+            var s: [Int] = []
+            var p = 0
+            while p + tileSize < total { s.append(p); p += stride }
+            s.append(total - tileSize)            // last tile clamped to the end
+            return s
+        }
+        let ys = starts(H), xs = starts(W)
+        let outTile = tileSize * scale
+        let outOverlap = overlap * scale
 
-        // Calculate tiles
-        let numTilesH = max(1, Int(ceil(Float(H - overlap) / Float(stride))))
-        let numTilesW = max(1, Int(ceil(Float(W - overlap) / Float(stride))))
+        // Full-size accumulators (weighted output sum + weight sum) — small; one tile decode at a time.
+        var acc = MLXArray.zeros([1, 3, outH, outW])
+        var wsum = MLXArray.zeros([1, 1, outH, outW])
 
-        Flux2Debug.verbose("VAE tiling: \(numTilesH)x\(numTilesW) tiles, size=\(tileSize), overlap=\(overlap)")
-
-        // Decode all tiles
-        var tiles: [[MLXArray]] = []
-        var tileHeights: [[Int]] = []
-        var tileWidths: [[Int]] = []
-
-        for tileY in 0..<numTilesH {
-            var row: [MLXArray] = []
-            var heights: [Int] = []
-            var widths: [Int] = []
-
-            for tileX in 0..<numTilesW {
-                let y0 = min(tileY * stride, max(0, H - tileSize))
-                let x0 = min(tileX * stride, max(0, W - tileSize))
-                let y1 = min(y0 + tileSize, H)
-                let x1 = min(x0 + tileSize, W)
-
-                let tile = z[0..., 0..., y0..<y1, x0..<x1]
-                let decoded = decode(tile)
-                eval(decoded)
-
-                row.append(decoded)
-                heights.append((y1 - y0) * 8)
-                widths.append((x1 - x0) * 8)
-
-                // Clear cache after each tile to manage memory
+        for (iy, y0) in ys.enumerated() {
+            for (ix, x0) in xs.enumerated() {
+                let tile = z[0..., 0..., y0 ..< (y0 + tileSize), x0 ..< (x0 + tileSize)]
+                let decoded = decode(tile)                              // [1, 3, outTile, outTile]
+                let mask = blendMask(size: outTile, overlap: outOverlap,
+                                     top: iy > 0, bottom: iy < ys.count - 1,
+                                     left: ix > 0, right: ix < xs.count - 1)
+                let oy = y0 * scale, ox = x0 * scale
+                let widths: [IntOrPair] = [[0, 0], [0, 0],
+                                           [oy, outH - oy - outTile], [ox, outW - ox - outTile]]
+                acc = acc + padded(decoded * mask, widths: widths)
+                wsum = wsum + padded(mask, widths: widths)
+                eval(acc, wsum)                                         // free this tile's feature maps
                 MLX.Memory.clearCache()
-
-                Flux2Debug.verbose("VAE tile [\(tileY),\(tileX)] decoded")
             }
-            tiles.append(row)
-            tileHeights.append(heights)
-            tileWidths.append(widths)
         }
-
-        Flux2Debug.log("VAE: Blending \(numTilesH * numTilesW) tiles")
-
-        // Reconstruct by cropping overlaps and concatenating
-        var rows: [MLXArray] = []
-        for tileY in 0..<numTilesH {
-            var rowTiles: [MLXArray] = []
-            for tileX in 0..<numTilesW {
-                let tile = tiles[tileY][tileX]
-                let h = tileHeights[tileY][tileX]
-                let w = tileWidths[tileY][tileX]
-
-                // Crop overlap regions (take center half of overlap from each side)
-                let cropTop = (tileY > 0) ? outOverlap / 2 : 0
-                let cropLeft = (tileX > 0) ? outOverlap / 2 : 0
-                let cropBottom = (tileY < numTilesH - 1) ? outOverlap / 2 : 0
-                let cropRight = (tileX < numTilesW - 1) ? outOverlap / 2 : 0
-
-                let cropped = tile[0..., 0..., cropTop..<(h - cropBottom), cropLeft..<(w - cropRight)]
-                rowTiles.append(cropped)
-            }
-            // Concatenate horizontally
-            let row = concatenated(rowTiles, axis: 3)
-            rows.append(row)
-        }
-        // Concatenate vertically
-        let result = concatenated(rows, axis: 2)
-
+        let result = acc / maximum(wsum, MLXArray(Float(1e-6)))
         Flux2Debug.log("VAE: Tiled decoding completed, output shape: \(result.shape)")
         return result
+    }
+
+    /// Boundary-aware feathered blend weights: 1 in the interior, linear falloff to ~0 ONLY on edges
+    /// flagged as overlapping a neighbor (image-border edges stay 1 — the accumulator divides by the
+    /// weight sum, and a near-zero border weight would blow up).
+    private func blendMask(size: Int, overlap: Int, top: Bool, bottom: Bool, left: Bool, right: Bool) -> MLXArray {
+        let ov = Swift.max(1, overlap)
+        var w = [Float](repeating: 1.0, count: size * size)
+        for y in 0..<size {
+            for x in 0..<size {
+                var weight: Float = 1.0
+                if top, y < ov { weight *= (Float(y) + 0.5) / Float(ov) }
+                if bottom, y >= size - ov { weight *= (Float(size - 1 - y) + 0.5) / Float(ov) }
+                if left, x < ov { weight *= (Float(x) + 0.5) / Float(ov) }
+                if right, x >= size - ov { weight *= (Float(size - 1 - x) + 0.5) / Float(ov) }
+                w[y * size + x] = Swift.max(weight, 1e-3)
+            }
+        }
+        return MLXArray(w).reshaped([1, 1, size, size])
     }
 
     /// Create a blending weight mask for tile overlap
