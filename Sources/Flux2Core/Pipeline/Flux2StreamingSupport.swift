@@ -46,4 +46,42 @@ public enum Flux2StreamingSupport {
                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
                        provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
     }
+
+    /// Encode ONE reference image for streaming image-to-image — the single-image, memory-bounded form
+    /// of the resident pipeline's `encodeReferenceImages`, reusing the SAME preprocess + VAE +
+    /// `LatentUtils` so the streamed reference latents are byte-for-byte the facade's (the 512 parity
+    /// gate checks this). `maxImageArea` caps the encoded resolution: iPhone passes 512² (≈1024 ref
+    /// tokens, the streaming budget) vs the resident default 1024² (≈4096). Returns the packed reference
+    /// latents `[1, refSeq, 128]` and their position ids `[refSeq, 4]` — the ids carry a distinct
+    /// T-coordinate (scale 10) so the transformer separates reference tokens from the T=0 output tokens.
+    /// The result is fully materialized so the caller can free the VAE before the transformer streams.
+    public static func encodeReferenceImage(_ image: CGImage, maxImageArea: Int,
+                                            vae: AutoencoderKLFlux2) -> (latents: MLXArray, positionIds: MLXArray) {
+        let multipleOf = 32  // vae_scale_factor * 2 — same constraint the resident encoder uses
+        var targetWidth = image.width
+        var targetHeight = image.height
+        let pixelCount = targetWidth * targetHeight
+        if pixelCount > maxImageArea {
+            let scale = (Double(maxImageArea) / Double(pixelCount)).squareRoot()
+            targetWidth = Int(Double(targetWidth) * scale)
+            targetHeight = Int(Double(targetHeight) * scale)
+        }
+        targetWidth = max((targetWidth / multipleOf) * multipleOf, multipleOf)
+        targetHeight = max((targetHeight / multipleOf) * multipleOf, multipleOf)
+
+        // EXACT mirror of Flux2Pipeline.encodeReferenceImages' per-image path: deterministic VAE mean
+        // (samplePosterior:false), patchify, BatchNorm-normalize, pack to sequence.
+        let processed = Flux2Pipeline.preprocessImageForVAE(image, targetHeight: targetHeight, targetWidth: targetWidth)
+        let rawLatents = vae.encode(processed, samplePosterior: false)            // [1,32,H/8,W/8] mean
+        var patchified = LatentUtils.packLatentsToPatchified(rawLatents)          // [1,128,H/16,W/16]
+        patchified = LatentUtils.normalizeLatentsWithBatchNorm(
+            patchified, runningMean: vae.batchNormRunningMean, runningVar: vae.batchNormRunningVar)
+        let packed = LatentUtils.packPatchifiedToSequence(patchified)             // [1, refSeq, 128]
+        let positionIds = LatentUtils.generateReferenceImagePositionIDs(
+            latentHeights: [targetHeight / 16], latentWidths: [targetWidth / 16], scale: 10)
+        // Realize the full VAE-encode chain now, while the VAE is still resident, so the caller may free
+        // the VAE before the transformer streams (no encoder ↔ transformer co-residency on the phone).
+        MLX.eval(packed, positionIds)
+        return (latents: packed, positionIds: positionIds)
+    }
 }

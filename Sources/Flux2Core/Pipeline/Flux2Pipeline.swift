@@ -1653,7 +1653,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             Flux2Debug.log("  -> Resized to \(targetWidth)x\(targetHeight)")
 
             // Preprocess and encode
-            let processed = preprocessImageForVAE(image, targetHeight: targetHeight, targetWidth: targetWidth)
+            let processed = Self.preprocessImageForVAE(image, targetHeight: targetHeight, targetWidth: targetWidth)
 
             // Encode with VAE -> [1, 32, H/8, W/8]
             // IMPORTANT: Use samplePosterior=false to get deterministic mean (like diffusers argmax)
@@ -1723,7 +1723,9 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// preserve exact pixel values without format conversion or anti-aliasing artifacts.
     /// When a resize is needed, uses CGContext with high-quality interpolation, then
     /// reads from the resized image's dataProvider.
-    private func preprocessImageForVAE(_ image: CGImage, targetHeight: Int, targetWidth: Int) -> MLXArray {
+    /// Pure (no instance state) so the streaming i2i ref-encoder (`Flux2StreamingSupport`) reuses the
+    /// EXACT resident preprocess — keeping the streamed reference encoding byte-for-byte with the facade.
+    public static func preprocessImageForVAE(_ image: CGImage, targetHeight: Int, targetWidth: Int) -> MLXArray {
         let sourceWidth = image.width
         let sourceHeight = image.height
 
@@ -1775,7 +1777,7 @@ public class Flux2Pipeline: @unchecked Sendable {
               CFDataGetLength(pixelCFData) >= height * bpr else {
             // Fallback to CGContext if direct access fails (e.g. compressed or unusual format)
             Flux2Debug.log("Direct pixel access failed, falling back to CGContext")
-            return preprocessImageForVAEViaCGContext(sourceImage, height: height, width: width)
+            return Self.preprocessImageForVAEViaCGContext(sourceImage, height: height, width: width)
         }
 
         let bytes = CFDataGetBytePtr(pixelCFData)!
@@ -1831,7 +1833,7 @@ public class Flux2Pipeline: @unchecked Sendable {
     }
 
     /// Fallback: read pixels via CGContext when direct data provider access is not possible.
-    private func preprocessImageForVAEViaCGContext(_ image: CGImage, height: Int, width: Int) -> MLXArray {
+    static func preprocessImageForVAEViaCGContext(_ image: CGImage, height: Int, width: Int) -> MLXArray {
         let bytesPerPixel = 4
         let bytesPerRow = bytesPerPixel * width
         var pixelData = [UInt8](repeating: 0, count: height * bytesPerRow)

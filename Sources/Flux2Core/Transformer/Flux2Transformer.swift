@@ -347,6 +347,10 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
         public let txtMod: [ModulationParams]
         public let singleMod: [ModulationParams]
         public let textSeqLen: Int
+        /// i2i streams the packed image as `[output ; reference]`; only the OUTPUT tokens are denoised
+        /// and decoded. This is the output token count, so `streamUnembed` returns just that slice.
+        /// `nil` ⇒ text-to-image (every image token after text is output) — byte-for-byte the original.
+        public let outputSeqLen: Int?
     }
 
     public var doubleStreamBlockCount: Int { transformerBlocks.count }
@@ -360,7 +364,7 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
     /// Returns the packed `[txt ; img]` hidden state plus the per-step context the blocks read.
     public func streamEmbed(hiddenStates: MLXArray, encoderHiddenStates: MLXArray,
                             timestep: MLXArray, guidance: MLXArray? = nil,
-                            imgIds: MLXArray, txtIds: MLXArray)
+                            imgIds: MLXArray, txtIds: MLXArray, outputSeqLen: Int? = nil)
         -> (hidden: MLXArray, context: Flux2StreamContext) {
         let imgHS = xEmbedder(hiddenStates)
         let txtHS = contextEmbedder(encoderHiddenStates)
@@ -375,7 +379,8 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
         let textSeqLen = txtHS.shape[1]
         let hidden = concatenated([txtHS, imgHS], axis: 1)
         return (hidden, Flux2StreamContext(temb: temb, rope: ropeEmb, imgMod: imgMod,
-                                           txtMod: txtMod, singleMod: singleMod, textSeqLen: textSeqLen))
+                                           txtMod: txtMod, singleMod: singleMod, textSeqLen: textSeqLen,
+                                           outputSeqLen: outputSeqLen))
     }
 
     /// Run one double-stream block on packed `[txt ; img]` hidden: split at `textSeqLen`, run with the
@@ -400,7 +405,12 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
 
     /// Unembed phase (mirror of the slice → final-norm → projection epilogue in `callAsFunction`).
     public func streamUnembed(hidden: MLXArray, context ctx: Flux2StreamContext) -> MLXArray {
-        var imgHS = hidden[0..., ctx.textSeqLen..., 0...]
+        // The packed image stream is `[output ; reference]`; only the OUTPUT tokens are denoised and
+        // decoded (the velocity must match the stepped latent's shape). `outputSeqLen == nil` (T2I) ⇒
+        // every image token after the text is output — byte-for-byte the original slice.
+        let imgStart = ctx.textSeqLen
+        let imgEnd = ctx.outputSeqLen.map { imgStart + $0 } ?? hidden.shape[1]
+        var imgHS = hidden[0..., imgStart ..< imgEnd, 0...]
         imgHS = normOut(imgHS, conditioning: ctx.temb)
         return projOut(imgHS)
     }
