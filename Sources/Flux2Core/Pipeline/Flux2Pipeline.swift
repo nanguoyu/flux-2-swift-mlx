@@ -1726,6 +1726,11 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// Pure (no instance state) so the streaming i2i ref-encoder (`Flux2StreamingSupport`) reuses the
     /// EXACT resident preprocess — keeping the streamed reference encoding byte-for-byte with the facade.
     public static func preprocessImageForVAE(_ image: CGImage, targetHeight: Int, targetWidth: Int) -> MLXArray {
+        // The VAE is 3-channel and has NO alpha. A reference with an alpha channel (e.g. a transparent
+        // PNG) must be composited onto an opaque background first — otherwise transparent regions read as
+        // BLACK (the zero-initialized resize buffer / the ignored-alpha direct read) and the model paints
+        // a black background. Flatten onto WHITE; opaque images pass through untouched.
+        let image = Self.flattenOntoWhiteIfNeeded(image)
         let sourceWidth = image.width
         let sourceHeight = image.height
 
@@ -1830,6 +1835,25 @@ public class Flux2Pipeline: @unchecked Sendable {
         }
 
         return MLXArray(floatData).reshaped([1, 3, height, width])
+    }
+
+    /// Composite an alpha-bearing image onto an opaque WHITE background, returning an opaque CGImage.
+    /// A no-op for images with no alpha channel (returns the input unchanged). Drawing source-over a
+    /// white-filled context resolves transparency to white instead of the black it would otherwise read
+    /// as — both the resize path (zero-init buffer) and the direct read (alpha ignored) need this.
+    static func flattenOntoWhiteIfNeeded(_ image: CGImage) -> CGImage {
+        let alpha = CGImageAlphaInfo(rawValue: image.bitmapInfo.rawValue & CGBitmapInfo.alphaInfoMask.rawValue)
+        if alpha == CGImageAlphaInfo.none || alpha == .noneSkipFirst || alpha == .noneSkipLast { return image }
+        let w = image.width, h = image.height
+        guard w > 0, h > 0, let ctx = CGContext(
+            data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ) else { return image }
+        ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)                 // white background
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))          // source-over composite
+        return ctx.makeImage() ?? image
     }
 
     /// Fallback: read pixels via CGContext when direct data provider access is not possible.
