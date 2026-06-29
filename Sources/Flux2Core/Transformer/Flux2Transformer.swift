@@ -350,7 +350,9 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
         /// i2i streams the packed image as `[output ; reference]`; only the OUTPUT tokens are denoised
         /// and decoded. This is the output token count, so `streamUnembed` returns just that slice.
         /// `nil` ⇒ text-to-image (every image token after text is output) — byte-for-byte the original.
-        public let outputSeqLen: Int?
+        /// `var` with a `= nil` default so the synthesized memberwise init DEFAULTS it (a `let … = nil`
+        /// would be excluded from the init and unsettable) — text-to-image callers omit it unchanged.
+        public var outputSeqLen: Int? = nil
     }
 
     public var doubleStreamBlockCount: Int { transformerBlocks.count }
