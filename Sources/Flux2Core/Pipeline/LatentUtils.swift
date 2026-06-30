@@ -28,17 +28,16 @@ public enum LatentUtils {
         patchSize: Int = 2,
         seed: UInt64? = nil
     ) -> MLXArray {
-        // Set seed if provided
-        if let seed = seed {
-            MLXRandom.seed(seed)
-        }
-
         // Patchified dimensions: channels = 32 * 2 * 2 = 128, spatial = original / 16
         let patchifiedChannels = latentChannels * patchSize * patchSize  // 128
         let patchifiedHeight = height / (8 * patchSize)   // H/16
         let patchifiedWidth = width / (8 * patchSize)     // W/16
+        let shape = [batchSize, patchifiedChannels, patchifiedHeight, patchifiedWidth]
 
-        return MLXRandom.normal([batchSize, patchifiedChannels, patchifiedHeight, patchifiedWidth])
+        // Draw from a PER-CALL key (matches Z-Image) so the noise is deterministic for a given seed WITHOUT
+        // mutating the process-global MLXRandom state for later ops. `seed == nil` ⇒ the global stream.
+        if let seed { return MLXRandom.normal(shape, key: MLXRandom.key(seed)) }
+        return MLXRandom.normal(shape)
     }
 
     /// Generate random initial noise for text-to-image (legacy, non-patchified)
@@ -56,15 +55,13 @@ public enum LatentUtils {
         latentChannels: Int = 32,
         seed: UInt64? = nil
     ) -> MLXArray {
-        // Set seed if provided
-        if let seed = seed {
-            MLXRandom.seed(seed)
-        }
-
         let latentHeight = height / 8
         let latentWidth = width / 8
+        let shape = [batchSize, latentChannels, latentHeight, latentWidth]
 
-        return MLXRandom.normal([batchSize, latentChannels, latentHeight, latentWidth])
+        // Per-call key (see generatePatchifiedLatents) — deterministic per seed, no global RNG mutation.
+        if let seed { return MLXRandom.normal(shape, key: MLXRandom.key(seed)) }
+        return MLXRandom.normal(shape)
     }
 
     // MARK: - Packing/Unpacking for Patchified Format
