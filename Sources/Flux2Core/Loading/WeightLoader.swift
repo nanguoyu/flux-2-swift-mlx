@@ -685,6 +685,20 @@ public class Flux2WeightLoader {
         }
 
         Flux2Debug.log("Applied \(updates.count) weights to transformer (\(notFound) not found)")
+
+        // Reverse check — every transformer parameter MUST come from the checkpoint. Unlike the
+        // streaming loader (which throws `missingTensor` per block), this resident path historically
+        // only logged a warning and called `update()` unconditionally, so a missing checkpoint key
+        // left that parameter at its random init and produced garbage with no error. The transformer
+        // has no side-channel / intentionally-absent parameters (RoPE is computed, not parameterized;
+        // all Linear/modulation/norm layers are checkpoint-backed; LoRA is injected only AFTER this
+        // call), so any uncovered parameter is a genuine load failure.
+        let uncovered = flatParameters.keys.filter { updates[$0] == nil }.sorted()
+        if !uncovered.isEmpty {
+            for k in uncovered.prefix(15) { Flux2Debug.log("  uncovered transformer parameter (left at random init): \(k)") }
+            throw Flux2WeightLoaderError.missingWeights(
+                "\(uncovered.count) transformer parameter(s) received no checkpoint weight and would run at random init (first: \(uncovered.first ?? "")). The checkpoint is missing keys or the key mapping diverged.")
+        }
     }
 
     /// Apply weights to a VAE model
@@ -736,6 +750,26 @@ public class Flux2WeightLoader {
         _ = model.update(parameters: ModuleParameters.unflattened(updates))
 
         Flux2Debug.log("Applied \(updates.count) weights to VAE (\(notFound) not found)")
+
+        // Reverse check — assert every VAE parameter that SHOULD come from the checkpoint received a
+        // value, so a missing conv/resnet/attention weight can no longer silently keep its random init.
+        // Precise whitelist of legitimately-absent parameters (verified against the model & loaders):
+        //   - `latentBatchNorm.runningMean` / `.runningVar`: loaded out-of-band via `loadBatchNormStats`
+        //     (handled above from the `bn.*` running keys) rather than through `update()`.
+        //   - `latentBatchNorm.weight` / `.bias`: the BatchNorm is an optional latent-normalization head;
+        //     standard FLUX VAE checkpoints (e.g. FLUX.2-klein-4B/vae) ship no `bn.*` keys, so these stay
+        //     at their init (ones/zeros = identity affine) and must NOT trip the guard.
+        // Everything else (encoder/decoder convs, resnets, attention, quant convs when present) is a real
+        // checkpoint weight; an uncovered one is a genuine load failure.
+        let batchNormPrefix = "latentBatchNorm."
+        let uncovered = flatParameters.keys
+            .filter { updates[$0] == nil && !$0.hasPrefix(batchNormPrefix) }
+            .sorted()
+        if !uncovered.isEmpty {
+            for k in uncovered.prefix(15) { Flux2Debug.log("  uncovered VAE parameter (left at random init): \(k)") }
+            throw Flux2WeightLoaderError.missingWeights(
+                "\(uncovered.count) VAE parameter(s) received no checkpoint weight and would run at random init (first: \(uncovered.first ?? "")). The checkpoint is missing keys or the key mapping diverged.")
+        }
     }
 
     // MARK: - Quantized Weight Loading
@@ -996,6 +1030,7 @@ public class Flux2WeightLoader {
 public enum Flux2WeightLoaderError: LocalizedError {
     case noWeightsFound(String)
     case weightMismatch(String)
+    case missingWeights(String)
     case fileNotFound(String)
     case incompatibleShape(expected: [Int], got: [Int], key: String)
 
@@ -1005,6 +1040,8 @@ public enum Flux2WeightLoaderError: LocalizedError {
             return "No safetensors files found in: \(path)"
         case .weightMismatch(let message):
             return "Weight mismatch: \(message)"
+        case .missingWeights(let message):
+            return "Missing weights: \(message)"
         case .fileNotFound(let path):
             return "File not found: \(path)"
         case .incompatibleShape(let expected, let got, let key):

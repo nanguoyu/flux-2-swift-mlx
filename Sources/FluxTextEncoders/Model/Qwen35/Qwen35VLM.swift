@@ -343,8 +343,11 @@ extension Qwen35VLM {
             do {
                 try visionEncoder.update(parameters: visionParams, verify: .noUnusedKeys)
             } catch {
-                FluxDebug.log("[Qwen3.5] Vision weight loading warning: \(error)")
-                try visionEncoder.update(parameters: visionParams, verify: .none)
+                // Tolerate extra/unused checkpoint keys, but keep `.shapeMismatch` rather than blanket-
+                // disabling verification — a corrupt / version-mismatched vision checkpoint with wrong
+                // shapes still fails loudly instead of silently degrading the encoder.
+                FluxDebug.log("[Qwen3.5] Vision strict verify failed (\(error)); retrying tolerating unused keys (shape check kept)")
+                try visionEncoder.update(parameters: visionParams, verify: .shapeMismatch)
             }
             eval(visionEncoder)
         }

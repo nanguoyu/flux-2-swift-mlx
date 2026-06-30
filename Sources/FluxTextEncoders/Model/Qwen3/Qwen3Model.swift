@@ -401,9 +401,15 @@ extension Qwen3ForCausalLM {
         do {
             try update(parameters: parameters, verify: .noUnusedKeys)
         } catch {
-            FluxDebug.log("Qwen3 weight loading warning: \(error)")
-            // Try again with .none to allow loading to proceed
-            try update(parameters: parameters, verify: .none)
+            // The strict pass also rejects EXTRA checkpoint keys the model doesn't use — which is benign
+            // here (this Qwen3 is loaded as an ENCODER: we only read hidden states from layers [9,18,27],
+            // and `lm_head` is legitimately absent under weight tying). So retry, but do NOT blanket-
+            // disable verification with `.none`: keep `.shapeMismatch` so a version-mismatched / corrupt
+            // encoder (wrong tensor shapes) still fails loudly instead of silently loading and degrading
+            // conditioning. We intentionally drop only `.noUnusedKeys`, and NOT `.allModelKeysSet`, because
+            // a tied `lm_head` would otherwise trip that check on a perfectly valid checkpoint.
+            FluxDebug.log("Qwen3: strict verify failed (\(error)); retrying tolerating only unused checkpoint keys (shape check kept)")
+            try update(parameters: parameters, verify: .shapeMismatch)
         }
 
         // Evaluate to ensure weights are loaded

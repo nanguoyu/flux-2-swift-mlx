@@ -380,8 +380,11 @@ extension Qwen3VLForCausalLM {
         do {
             try update(parameters: parameters, verify: .noUnusedKeys)
         } catch {
-            FluxDebug.log("Qwen3-VL weight loading warning: \(error)")
-            try update(parameters: parameters, verify: .none)
+            // Tolerate extra/unused checkpoint keys, but keep `.shapeMismatch` rather than blanket-
+            // disabling verification — a corrupt / version-mismatched checkpoint with wrong shapes still
+            // fails loudly instead of silently degrading the encoder.
+            FluxDebug.log("Qwen3-VL: strict verify failed (\(error)); retrying tolerating unused keys (shape check kept)")
+            try update(parameters: parameters, verify: .shapeMismatch)
         }
 
         eval(self)

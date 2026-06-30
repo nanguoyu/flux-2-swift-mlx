@@ -269,8 +269,12 @@ extension Qwen35ForConditionalGeneration {
         do {
             try model.update(parameters: parameters, verify: .noUnusedKeys)
         } catch {
-            FluxDebug.log("Qwen3.5 weight loading warning: \(error)")
-            try model.update(parameters: parameters, verify: .none)
+            // Tolerate extra/unused checkpoint keys (vision tensors stripped above, a tied `lm_head`),
+            // but keep `.shapeMismatch` instead of blanket-disabling verification — a corrupt / version-
+            // mismatched checkpoint with wrong shapes still fails loudly. We keep `.allModelKeysSet` OFF
+            // on purpose: `lm_head` is legitimately absent under weight tying (handled just below).
+            FluxDebug.log("Qwen3.5: strict verify failed (\(error)); retrying tolerating unused keys (shape check kept)")
+            try model.update(parameters: parameters, verify: .shapeMismatch)
         }
         eval(model)
 
