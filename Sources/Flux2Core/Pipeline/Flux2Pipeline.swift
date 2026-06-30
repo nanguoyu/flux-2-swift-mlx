@@ -95,6 +95,13 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// because thermal pacing must be able to `await` without blocking a cooperative-pool thread.
     public var thermalThrottle: Flux2ThermalThrottle?
 
+    /// Optional app-supplied preview hook, called once per denoise step with the x0-PREDICTION packed
+    /// latent (`latent - sigma·velocity`, the extrapolation to sigma=0 — a clean image from step 1, not
+    /// the noisy in-loop latent). The caller maps it to an RGB preview (it owns the latent→RGB factors).
+    /// Lets the RESIDENT facade show the image forming, like the streaming engine already does. nil ⇒ no
+    /// preview cost. For i2i it receives the OUTPUT-token portion only.
+    public var onPreviewLatent: ((MLXArray) -> Void)?
+
     private func checkpoint() throws {
         try controlCheckpoint?()
         try Task.checkCancellation()
@@ -1290,6 +1297,9 @@ public class Flux2Pipeline: @unchecked Sendable {
                 // noisePred shape is [1, total_seq, 128], we want first outputSeqLen
                 let outputNoisePred = noisePred[0..., 0..<outputSeqLen, 0...]
 
+                // x0-prediction preview (OUTPUT portion only) — see the t2i path.
+                onPreviewLatent?(packedOutputLatents - sigma * outputNoisePred)
+
                 // Scheduler step on OUTPUT latents only
                 packedOutputLatents = scheduler.step(
                     modelOutput: outputNoisePred,
@@ -1449,6 +1459,10 @@ public class Flux2Pipeline: @unchecked Sendable {
                 imgIds: imageIds,
                 txtIds: textIds
             )
+
+            // x0-prediction preview (extrapolate the flow to sigma=0) — lets the resident facade show
+            // the image forming, like the streaming engine. Skipped entirely when no preview hook is set.
+            onPreviewLatent?(packedLatents - sigma * noisePred)
 
             // Scheduler step
             packedLatents = scheduler.step(
