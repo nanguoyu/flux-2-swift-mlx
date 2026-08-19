@@ -51,33 +51,11 @@ public class KleinTextEncoder: @unchecked Sendable {
             // Determine Qwen3 variant based on Klein variant and quantization
             // Note: Qwen3 package only has 8-bit and 4-bit variants, no bf16
             //
-            // IMPORTANT: First check if a Qwen3 variant is already downloaded to avoid
-            // unnecessary downloads. This is especially useful when training where the
-            // transformer uses bf16 but we want to reuse an existing 4-bit text encoder.
-            let qwen3Variant: Qwen3Variant
-
-            // Check what's already downloaded for this Klein variant
-            let downloadedVariant = findDownloadedQwen3Variant(for: variant)
-
-            if let downloaded = downloadedVariant {
-                // Use already downloaded variant
-                Flux2Debug.log("Found existing Qwen3 model: \(downloaded.displayName)")
-                qwen3Variant = downloaded
-            } else {
-                // No variant downloaded, determine preferred based on quantization
-                switch (variant, quantization) {
-                case (.klein4B, .bf16), (.klein4B, .mlx8bit):
-                    // Use 8-bit for both bf16 and 8bit (bf16 not available for Qwen3)
-                    qwen3Variant = .qwen3_4B_8bit
-                case (.klein4B, .mlx6bit), (.klein4B, .mlx4bit):
-                    qwen3Variant = .qwen3_4B_4bit
-                case (.klein9B, .bf16), (.klein9B, .mlx8bit):
-                    // Use 8-bit for both bf16 and 8bit (bf16 not available for Qwen3)
-                    qwen3Variant = .qwen3_8B_8bit
-                case (.klein9B, .mlx6bit), (.klein9B, .mlx4bit):
-                    qwen3Variant = .qwen3_8B_4bit
-                }
-            }
+            // Quantization is an explicit caller choice. Never silently replace it
+            // with another already-downloaded checkpoint: doing so makes a 4-bit
+            // selection load the 8-bit encoder whenever both are present, violating
+            // memory expectations and making model-management UI dishonest.
+            let qwen3Variant = resolvedQwen3Variant
 
             try await FluxTextEncoders.shared.loadKleinModel(
                 variant: variant,
@@ -90,23 +68,20 @@ public class KleinTextEncoder: @unchecked Sendable {
         Flux2Debug.log("Klein text encoder loaded successfully")
     }
 
-    /// Find an already downloaded Qwen3 variant for the given Klein variant
-    private func findDownloadedQwen3Variant(for kleinVariant: KleinVariant) -> Qwen3Variant? {
-        let candidates: [Qwen3Variant]
-        switch kleinVariant {
-        case .klein4B:
-            // Prefer 8-bit, but use 4-bit if that's what's downloaded
-            candidates = [.qwen3_4B_8bit, .qwen3_4B_4bit]
-        case .klein9B:
-            candidates = [.qwen3_8B_8bit, .qwen3_8B_4bit]
+    /// The exact checkpoint implied by the caller's quantization choice.
+    /// Internal for a network-free regression test in `Flux2CoreTests`.
+    var resolvedQwen3Variant: Qwen3Variant {
+        switch (variant, quantization) {
+        case (.klein4B, .bf16), (.klein4B, .mlx8bit):
+            // Qwen3 has no bf16 checkpoint, so bf16 maps to its 8-bit variant.
+            return .qwen3_4B_8bit
+        case (.klein4B, .mlx6bit), (.klein4B, .mlx4bit):
+            return .qwen3_4B_4bit
+        case (.klein9B, .bf16), (.klein9B, .mlx8bit):
+            return .qwen3_8B_8bit
+        case (.klein9B, .mlx6bit), (.klein9B, .mlx4bit):
+            return .qwen3_8B_4bit
         }
-
-        for candidate in candidates {
-            if TextEncoderModelDownloader.isQwen3ModelDownloaded(variant: candidate) {
-                return candidate
-            }
-        }
-        return nil
     }
 
     // MARK: - Prompt Upsampling
