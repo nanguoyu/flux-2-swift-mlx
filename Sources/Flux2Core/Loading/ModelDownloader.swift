@@ -3,13 +3,14 @@
 
 import Foundation
 import CryptoKit
+import FluxTextEncoders
 
 /// Progress callback for download updates
 public typealias Flux2DownloadProgressCallback = @Sendable (Double, String) -> Void
 
 /// Downloads Flux.2 models from HuggingFace Hub
 public class Flux2ModelDownloader: @unchecked Sendable {
-    private struct HubFile: Sendable {
+    struct HubFile: Sendable {
         var path: String
         var size: Int64?
         var sha256: String?
@@ -33,19 +34,24 @@ public class Flux2ModelDownloader: @unchecked Sendable {
     /// URLSession for downloads
     private let session: URLSession
 
-    public init(hfToken: String? = nil) {
-        self.hfToken = hfToken
-        if let token = hfToken {
-            setenv("HF_TOKEN", token, 1)
-        }
-
+    public convenience init(hfToken: String? = nil) {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForResource = 3600  // 1 hour for large models
         // iOS otherwise caches large downloads in URLCache, doubling on-disk usage for multi-GB
         // models (the same bug the Z-Image downloader hit). Disable it — harmless on macOS.
         config.urlCache = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        self.session = URLSession(configuration: config)
+        self.init(hfToken: hfToken, sessionConfiguration: config)
+    }
+
+    /// Test seam: the same downloader over a caller-supplied session configuration
+    /// (e.g. one whose `protocolClasses` stub the network).
+    init(hfToken: String? = nil, sessionConfiguration: URLSessionConfiguration) {
+        self.hfToken = hfToken
+        if let token = hfToken {
+            setenv("HF_TOKEN", token, 1)
+        }
+        self.session = URLSession(configuration: sessionConfiguration)
     }
 
     // MARK: - Model Paths
@@ -241,12 +247,7 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         // Get file list from HuggingFace API
         let files = try await fetchFileList(repoId: repoId, subfolder: subfolder)
 
-        // Filter to only necessary files
-        let filesToDownload = files.filter { file in
-            file.path.hasSuffix(".safetensors") ||
-            file.path.hasSuffix(".json") ||
-            file.path == "tokenizer.model"
-        }
+        let filesToDownload = Self.componentFiles(from: files, subfolder: subfolder)
 
         guard !filesToDownload.isEmpty else {
             throw Flux2DownloadError.modelNotFound("No model files found in \(repoId)")
@@ -255,6 +256,15 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         // Create destination directory
         let destDir = ModelRegistry.localPath(for: component)
         try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
+
+        // Names an earlier run of this downloader recorded here (possibly the recursive layout that
+        // pulled sibling folders into this directory); used to clean up after success.
+        let previouslyRecorded = Self.manifestFilenames(at: destDir)
+
+        // Record the expected file set BEFORE fetching anything: until every listed file is present
+        // with its expected size, findModelPath() rejects this directory, so an interrupted first
+        // download can never read as installed just because one weight file already landed.
+        try Self.writeManifest(filesToDownload, at: destDir)
 
         // Download each file
         let totalBytes = max(1, filesToDownload.reduce(Int64(0)) { $0 + ($1.size ?? 0) })
@@ -290,10 +300,10 @@ public class Flux2ModelDownloader: @unchecked Sendable {
             Flux2Debug.log("Downloaded \(fileName) (\(Self.formatSize(completedBytes)) total)")
         }
 
+        Self.removeStaleFiles(in: destDir, keeping: filesToDownload, previouslyRecorded: previouslyRecorded)
+
         let verification = Self.verifyModel(at: destDir)
         guard verification.complete else { throw Flux2DownloadError.verificationFailed(verification.missing) }
-
-        try Self.writeManifest(filesToDownload, at: destDir)
 
         progress?(1.0, "Download complete: \(Self.formatSize(completedBytes))")
         return destDir
@@ -309,6 +319,50 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         case .textEncoder:
             return nil
         }
+    }
+
+    /// The files of one component: its own folder's direct children (the repo root when
+    /// `subfolder` is nil) that the loaders read. Files in nested folders are excluded: they belong
+    /// to OTHER components (a Klein repo root also holds `text_encoder/`, `transformer/` and `vae/`,
+    /// each with its own `config.json` / `diffusion_pytorch_model.safetensors`), the loaders only
+    /// read the top level of the component directory, and flattening them into one directory made
+    /// same-named files overwrite each other. This matches the layout written before listings
+    /// became recursive, so existing downloads stay valid.
+    static func componentFiles(from files: [HubFile], subfolder: String?) -> [HubFile] {
+        let prefix = subfolder.map { $0.hasSuffix("/") ? $0 : $0 + "/" } ?? ""
+        return files.filter { file in
+            guard file.path.hasPrefix(prefix) else { return false }
+            let relative = file.path.dropFirst(prefix.count)
+            guard !relative.isEmpty, !relative.contains("/") else { return false }
+            return relative.hasSuffix(".safetensors") || relative.hasSuffix(".json") || relative == "tokenizer.model"
+        }
+    }
+
+    /// After a successful download, delete what this downloader owns but no longer expects:
+    /// names recorded by an earlier manifest, and any stray `.safetensors` or `.part` (the
+    /// transformer loader reads EVERY top-level `.safetensors`, so a leftover text-encoder shard
+    /// would be merged into the transformer weights).
+    private static func removeStaleFiles(in directory: URL, keeping files: [HubFile], previouslyRecorded: Set<String>) {
+        let expected = Set(files.map { URL(fileURLWithPath: $0.path).lastPathComponent })
+        let fm = FileManager.default
+        let contents = (try? fm.contentsOfDirectory(atPath: directory.path)) ?? []
+        for name in contents where !expected.contains(name) && name != manifestFilename {
+            let owned = previouslyRecorded.contains(name)
+                || name.hasSuffix(".safetensors")
+                || name.hasSuffix(".part")
+            guard owned else { continue }
+            var isDir: ObjCBool = false
+            let url = directory.appendingPathComponent(name)
+            guard fm.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue else { continue }
+            try? fm.removeItem(at: url)
+        }
+    }
+
+    private static func manifestFilenames(at directory: URL) -> Set<String> {
+        let url = directory.appendingPathComponent(manifestFilename)
+        guard let data = try? Data(contentsOf: url),
+              let manifest = try? JSONDecoder().decode(DownloadManifest.self, from: data) else { return [] }
+        return Set(manifest.files.map(\.filename))
     }
 
     /// Fetch file list from HuggingFace API
@@ -390,22 +444,12 @@ public class Flux2ModelDownloader: @unchecked Sendable {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
-        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-
+        // STREAMING download straight into `.part`: a cancel or pause keeps every received byte and
+        // the next attempt resumes with a Range request (see ResumableFileDownload for the 200/206
+        // and Content-Range rules).
         let partURL = destination.appendingPathExtension("part")
-        let existingBytes = Self.fileSize(partURL)
-        if existingBytes > 0 {
-            request.setValue("bytes=\(existingBytes)-", forHTTPHeaderField: "Range")
-        }
-
-        // STREAMING download straight into `.part` via a per-task delegate. We deliberately avoid
-        // session.download(for:), which downloads the WHOLE body atomically to a system temp file —
-        // cancelling mid-file there discards every in-progress byte, so a 4.6 GB shard restarts at 0.
-        // By writing each received chunk to `.part` as it arrives, a cancel leaves a valid partial
-        // that the Range header above resumes next time. Resume is handled by the Range header + the
-        // 200/206 branch logic inside the delegate.
-        try await Self.streamDownload(request: request, into: partURL, existingBytes: existingBytes,
-                                       filePath: filePath, session: session, progress: progress)
+        try await ResumableFileDownload.stream(request, into: partURL, filePath: filePath,
+                                               session: session, progress: progress)
 
         guard Self.fileMatches(partURL, expectedSize: expectedSize, expectedSHA256: expectedSHA256) else {
             // Delete the corrupt partial so a retry re-downloads from scratch instead of forever
@@ -419,162 +463,6 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         try FileManager.default.moveItem(at: partURL, to: destination)
 
         return destination
-    }
-
-    /// Stream a download into `partURL` chunk-by-chunk, so a cancellation leaves a valid resumable
-    /// partial. Uses a `URLSessionDataTask` with a PER-TASK delegate (iOS 15+/macOS 12+) so the shared
-    /// `session` is untouched. `existingBytes` is the size of any pre-existing `.part` we may resume.
-    private static func streamDownload(request: URLRequest, into partURL: URL, existingBytes: Int64,
-                                       filePath: String, session: URLSession,
-                                       progress: @escaping @Sendable (Int64) -> Void) async throws {
-        try Task.checkCancellation()
-        let delegate = StreamingDownloadDelegate(partURL: partURL, existingBytes: existingBytes,
-                                                 filePath: filePath, progress: progress)
-        let task = session.dataTask(with: request)
-        task.delegate = delegate
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                delegate.continuation = continuation
-                task.resume()
-            }
-        } onCancel: {
-            // Ends the stream; the FileHandle's already-written bytes stay in `.part` for next time.
-            task.cancel()
-        }
-    }
-
-    /// Per-task delegate that writes the response body into `.part` as it streams in. The FileHandle
-    /// write + cumulative counter run on the URLSession's (serial) delegate queue; the continuation
-    /// and handle are each touched exactly once, guarded by `lock`.
-    private final class StreamingDownloadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-        private let partURL: URL
-        private let existingBytes: Int64
-        private let filePath: String
-        private let progress: @Sendable (Int64) -> Void
-
-        private let lock = NSLock()
-        private var handle: FileHandle?
-        private var writtenTotal: Int64       // cumulative bytes currently in `.part`
-        private var finished = false          // guards continuation + handle-close (exactly once)
-        private var setupError: Error?        // error raised in didReceive response
-
-        // Progress throttling: emit at most ~once per 250 ms or per 8 MB.
-        private var lastProgressTime = DispatchTime.now()
-        private var bytesSinceProgress: Int64 = 0
-
-        var continuation: CheckedContinuation<Void, Error>?
-
-        init(partURL: URL, existingBytes: Int64, filePath: String,
-             progress: @escaping @Sendable (Int64) -> Void) {
-            self.partURL = partURL
-            self.existingBytes = existingBytes
-            self.filePath = filePath
-            self.progress = progress
-            self.writtenTotal = existingBytes
-        }
-
-        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
-                        didReceive response: URLResponse,
-                        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-            guard let http = response as? HTTPURLResponse else {
-                fail(with: Flux2DownloadError.downloadFailed("Failed to download \(filePath)"))
-                completionHandler(.cancel)
-                return
-            }
-
-            var startBytes = existingBytes
-            if existingBytes > 0 && http.statusCode != 206 {
-                // Server ignored Range and returned the whole file (200) — discard the partial so we
-                // never append a full body onto a partial one (corruption). Start fresh.
-                try? FileManager.default.removeItem(at: partURL)
-                startBytes = 0
-            }
-
-            guard http.statusCode == 200 || http.statusCode == 206 else {
-                fail(with: Flux2DownloadError.downloadFailed("Failed to download \(filePath): HTTP \(http.statusCode)"))
-                completionHandler(.cancel)
-                return
-            }
-
-            do {
-                if startBytes == 0 {
-                    // Fresh (or Range-reset) download: (re)create an empty `.part`.
-                    if FileManager.default.fileExists(atPath: partURL.path) {
-                        try FileManager.default.removeItem(at: partURL)
-                    }
-                    FileManager.default.createFile(atPath: partURL.path, contents: nil)
-                    let h = try FileHandle(forWritingTo: partURL)
-                    lock.lock(); handle = h; writtenTotal = 0; lock.unlock()
-                } else {
-                    // Resume (206): append to the existing `.part`.
-                    let h = try FileHandle(forWritingTo: partURL)
-                    try h.seekToEnd()
-                    lock.lock(); handle = h; writtenTotal = startBytes; lock.unlock()
-                }
-            } catch {
-                fail(with: error)
-                completionHandler(.cancel)
-                return
-            }
-
-            completionHandler(.allow)
-        }
-
-        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-            lock.lock()
-            guard let h = handle, !finished else { lock.unlock(); return }
-            do {
-                try h.write(contentsOf: data)
-                writtenTotal += Int64(data.count)
-                bytesSinceProgress += Int64(data.count)
-                let now = DispatchTime.now()
-                let elapsedMs = (now.uptimeNanoseconds - lastProgressTime.uptimeNanoseconds) / 1_000_000
-                let total = writtenTotal
-                let shouldReport = elapsedMs >= 250 || bytesSinceProgress >= 8 * 1024 * 1024
-                if shouldReport {
-                    lastProgressTime = now
-                    bytesSinceProgress = 0
-                }
-                lock.unlock()
-                if shouldReport { progress(total) }
-            } catch {
-                lock.unlock()
-                fail(with: error)
-                dataTask.cancel()
-            }
-        }
-
-        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-            lock.lock()
-            if finished { lock.unlock(); return }
-            finished = true
-            try? handle?.close()      // flush before we let the caller verify
-            handle = nil
-            let pending = continuation
-            continuation = nil
-            let setup = setupError
-            let total = writtenTotal
-            lock.unlock()
-
-            // Emit a final progress so the throttled value reflects the true `.part` size.
-            progress(total)
-
-            if let setup = setup {
-                pending?.resume(throwing: setup)
-            } else if let error = error {
-                pending?.resume(throwing: error)
-            } else {
-                pending?.resume(returning: ())
-            }
-        }
-
-        /// Record a setup/write failure; the actual continuation resume happens in didCompleteWithError
-        /// (cancelling the task drives us there), so close + resume stay exactly-once.
-        private func fail(with error: Error) {
-            lock.lock()
-            if setupError == nil { setupError = error }
-            lock.unlock()
-        }
     }
 
     private static func writeManifest(_ files: [HubFile], at directory: URL) throws {

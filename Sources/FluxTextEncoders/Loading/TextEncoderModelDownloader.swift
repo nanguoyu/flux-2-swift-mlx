@@ -88,16 +88,22 @@ public class TextEncoderModelDownloader {
         return homeDir.appendingPathComponent(".mistral").appendingPathComponent("models")
     }
 
-    public init(hfToken: String? = nil) {
-        self.hfToken = hfToken
-        if let token = hfToken {
-            setenv("HF_TOKEN", token, 1)
-        }
+    public convenience init(hfToken: String? = nil) {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForResource = 3600
         config.urlCache = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        self.session = URLSession(configuration: config)
+        self.init(hfToken: hfToken, sessionConfiguration: config)
+    }
+
+    /// Test seam: the same downloader over a caller-supplied session configuration
+    /// (e.g. one whose `protocolClasses` stub the network).
+    init(hfToken: String? = nil, sessionConfiguration: URLSessionConfiguration) {
+        self.hfToken = hfToken
+        if let token = hfToken {
+            setenv("HF_TOKEN", token, 1)
+        }
+        self.session = URLSession(configuration: sessionConfiguration)
     }
 
     /// Check if a model is already downloaded
@@ -370,12 +376,19 @@ public class TextEncoderModelDownloader {
         progress: TextEncoderDownloadProgressCallback? = nil
     ) async throws -> URL {
         let allFiles = try await fetchHubFiles(repoId: repoId)
-        let files = allFiles.filter { matching($0.path) }
+        // The destination is one flat directory: only the repo's top-level files belong in it, so
+        // same-named files from nested folders can never overwrite each other.
+        let files = allFiles.filter { !$0.path.contains("/") && matching($0.path) }
         guard !files.isEmpty else { throw TextEncoderModelDownloaderError.downloadFailed("No model files found in \(repoId)") }
 
         var destDir = Self.hubDownloadDirectory
         for part in repoId.split(separator: "/") { destDir = destDir.appendingPathComponent(String(part)) }
         try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
+
+        // Record the expected file set BEFORE fetching anything, so an interrupted download (for
+        // example after the weights landed but before the tokenizer files) is never reported as
+        // installed by findQwen3ModelPath().
+        try Self.writeManifest(files, at: destDir)
 
         let totalBytes = max(1, files.reduce(Int64(0)) { $0 + ($1.size ?? 0) })
         var completedBytes: Int64 = 0
@@ -394,7 +407,6 @@ public class TextEncoderModelDownloader {
             }
             completedBytes += Self.fileSize(destination)
         }
-        try Self.writeManifest(files, at: destDir)
         return destDir
     }
 
@@ -434,40 +446,11 @@ public class TextEncoderModelDownloader {
         }
         var request = URLRequest(url: url)
         if let token = hfToken { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        // Stream straight into `.part` so a cancel, pause or dropped connection keeps the received
+        // bytes and the next attempt resumes with a Range request.
         let partURL = destination.appendingPathExtension("part")
-        var existingBytes = Self.fileSize(partURL)
-        if existingBytes > 0 { request.setValue("bytes=\(existingBytes)-", forHTTPHeaderField: "Range") }
-
-        // Native chunked download to a temp file (URLSession.bytes' per-UInt8 AsyncSequence is far too
-        // slow for multi-GB encoder shards). Resume is handled via the Range header + the .part file.
-        let (tempURL, response) = try await session.download(for: request)
-        defer { try? FileManager.default.removeItem(at: tempURL) }
-        guard let http = response as? HTTPURLResponse else {
-            throw TextEncoderModelDownloaderError.downloadFailed("Invalid response for \(filePath)")
-        }
-        if existingBytes > 0, http.statusCode != 206 {
-            // Server ignored the Range and sent the full file — discard the partial to avoid corruption.
-            try? FileManager.default.removeItem(at: partURL)
-            existingBytes = 0
-        }
-        guard http.statusCode == 200 || http.statusCode == 206 else {
-            throw TextEncoderModelDownloaderError.downloadFailed("HTTP \(http.statusCode) for \(filePath)")
-        }
-        try Task.checkCancellation()
-        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if existingBytes == 0 {
-            if FileManager.default.fileExists(atPath: partURL.path) { try FileManager.default.removeItem(at: partURL) }
-            try FileManager.default.moveItem(at: tempURL, to: partURL)
-        } else {
-            let outHandle = try FileHandle(forWritingTo: partURL)
-            let inHandle = try FileHandle(forReadingFrom: tempURL)
-            defer { try? outHandle.close(); try? inHandle.close() }
-            try outHandle.seekToEnd()
-            while let chunk = try inHandle.read(upToCount: 8 * 1024 * 1024), !chunk.isEmpty {
-                try outHandle.write(contentsOf: chunk)
-            }
-        }
-        progress(Self.fileSize(partURL))
+        try await ResumableFileDownload.stream(request, into: partURL, filePath: filePath,
+                                               session: session, progress: progress)
         guard Self.fileMatches(partURL, expectedSize: expectedSize, expectedSHA256: expectedSHA256) else {
             // Remove the corrupt partial so a retry re-downloads from scratch, not the same bad prefix.
             try? FileManager.default.removeItem(at: partURL)
