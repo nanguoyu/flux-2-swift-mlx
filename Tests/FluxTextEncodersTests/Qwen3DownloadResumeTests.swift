@@ -17,6 +17,10 @@ final class QwenStubHub: URLProtocol {
         repo = ""; files = [:]; failing = []; requests = []
     }
 
+    static func etag(_ data: Data) -> String {
+        "\"" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() + "\""
+    }
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func stopLoading() {}
@@ -44,7 +48,10 @@ final class QwenStubHub: URLProtocol {
             if failing.contains(name) {
                 status = 503
             } else if let data = files[name] {
-                if let range = request.value(forHTTPHeaderField: "Range"),
+                let etag = Self.etag(data)
+                headers["ETag"] = etag
+                let ifRange = request.value(forHTTPHeaderField: "If-Range")
+                if let range = request.value(forHTTPHeaderField: "Range"), ifRange == nil || ifRange == etag,
                    let start = Int(range.dropFirst("bytes=".count).dropLast()), start < data.count {
                     status = 206
                     headers["Content-Range"] = "bytes \(start)-\(data.count - 1)/\(data.count)"
@@ -123,19 +130,92 @@ final class Qwen3DownloadResumeTests: XCTestCase {
 
     func testPartialWeightsResumeWithRange() async throws {
         try FileManager.default.createDirectory(at: repoDir, withIntermediateDirectories: true)
-        try weights.prefix(1234).write(to: repoDir.appendingPathComponent("model.safetensors.part"))
+        let part = repoDir.appendingPathComponent("model.safetensors.part")
+        try weights.prefix(1234).write(to: part)
+        try ResumableFileDownload.writeValidator(.init(etag: QwenStubHub.etag(weights)), for: part)
 
         _ = try await downloader().downloadQwen3(variant: variant)
 
         let request = QwenStubHub.requests.first { $0.url?.path.hasSuffix("/model.safetensors") == true }
         XCTAssertEqual(request?.value(forHTTPHeaderField: "Range"), "bytes=1234-")
+        XCTAssertEqual(request?.value(forHTTPHeaderField: "If-Range"), QwenStubHub.etag(weights))
         XCTAssertEqual(try Data(contentsOf: repoDir.appendingPathComponent("model.safetensors")), weights)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: repoDir.appendingPathComponent("model.safetensors.part").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: part.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ResumableFileDownload.validatorURL(for: part).path))
     }
 
-    func testContentRangeStartParsing() {
+    func testChangedUpstreamFileRestartsFromZero() async throws {
+        try FileManager.default.createDirectory(at: repoDir, withIntermediateDirectories: true)
+        let part = repoDir.appendingPathComponent("model.safetensors.part")
+        try Data(repeating: 0xEE, count: 1234).write(to: part)
+        try ResumableFileDownload.writeValidator(.init(etag: "\"old-upload\""), for: part)
+
+        _ = try await downloader().downloadQwen3(variant: variant)
+
+        let request = QwenStubHub.requests.first { $0.url?.path.hasSuffix("/model.safetensors") == true }
+        XCTAssertEqual(request?.value(forHTTPHeaderField: "If-Range"), "\"old-upload\"")
+        XCTAssertEqual(try Data(contentsOf: repoDir.appendingPathComponent("model.safetensors")), weights)
+    }
+
+    /// The validator recorded for a later resume is the FINAL response's, not the redirect's.
+    func testValidatorComesFromTheFinalResponseAfterRedirect() async throws {
+        let part = root.appendingPathComponent("blob.part")
+        var request = URLRequest(url: URL(string: "https://huggingface.co/\(variant.repoId)/resolve/main/redirected.bin")!)
+        request.setValue("Bearer x", forHTTPHeaderField: "Authorization")
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RedirectingStub.self]
+        RedirectingStub.body = Data(repeating: 7, count: 300)
+
+        try await ResumableFileDownload.stream(request, into: part, filePath: "redirected.bin",
+                                               expectedSize: 300, session: URLSession(configuration: config),
+                                               progress: { _ in })
+
+        XCTAssertEqual(ResumableFileDownload.readValidator(for: part), .init(etag: "\"final\""))
+        try ResumableFileDownload.commit(part, to: root.appendingPathComponent("blob"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ResumableFileDownload.validatorURL(for: part).path))
+    }
+
+    func testWeakETagFallsBackToLastModified() {
+        let url = URL(string: "https://example.invalid/f")!
+        let weak = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil,
+                                   headerFields: ["ETag": "W/\"abc\"", "Last-Modified": "Tue, 10 Nov 2026 10:00:00 GMT"])!
+        XCTAssertEqual(ResumableFileDownload.Validator(response: weak),
+                       .init(lastModified: "Tue, 10 Nov 2026 10:00:00 GMT"))
+        let none = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: [:])!
+        XCTAssertNil(ResumableFileDownload.Validator(response: none))
+    }
+
+    func testContentRangeParsing() {
         XCTAssertEqual(ResumableFileDownload.contentRangeStart("bytes 1234-4999/5000"), 1234)
+        XCTAssertEqual(ResumableFileDownload.contentRangeTotal("bytes 1234-4999/5000"), 5000)
+        XCTAssertNil(ResumableFileDownload.contentRangeTotal("bytes 1234-4999/*"))
         XCTAssertNil(ResumableFileDownload.contentRangeStart("bytes */5000"))
         XCTAssertNil(ResumableFileDownload.contentRangeStart(nil))
+    }
+}
+
+/// Redirects every `huggingface.co` request to a CDN host; the redirect and the CDN answer carry
+/// different ETags.
+final class RedirectingStub: URLProtocol {
+    nonisolated(unsafe) static var body = Data()
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func stopLoading() {}
+
+    override func startLoading() {
+        let url = request.url!
+        if url.host == "huggingface.co" {
+            let target = URL(string: "https://cdn.stub.invalid/blob")!
+            let redirect = HTTPURLResponse(url: url, statusCode: 302, httpVersion: "HTTP/1.1",
+                                           headerFields: ["Location": target.absoluteString, "ETag": "\"redirect\""])!
+            client?.urlProtocol(self, wasRedirectedTo: URLRequest(url: target), redirectResponse: redirect)
+            return
+        }
+        let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                                       headerFields: ["ETag": "\"final\""])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.body)
+        client?.urlProtocolDidFinishLoading(self)
     }
 }

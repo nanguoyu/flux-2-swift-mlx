@@ -447,17 +447,17 @@ public class TextEncoderModelDownloader {
         var request = URLRequest(url: url)
         if let token = hfToken { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         // Stream straight into `.part` so a cancel, pause or dropped connection keeps the received
-        // bytes and the next attempt resumes with a Range request.
+        // bytes and the next attempt resumes with Range + If-Range against the recorded validator.
         let partURL = destination.appendingPathExtension("part")
         try await ResumableFileDownload.stream(request, into: partURL, filePath: filePath,
+                                               expectedSize: expectedSize,
                                                session: session, progress: progress)
         guard Self.fileMatches(partURL, expectedSize: expectedSize, expectedSHA256: expectedSHA256) else {
-            // Remove the corrupt partial so a retry re-downloads from scratch, not the same bad prefix.
-            try? FileManager.default.removeItem(at: partURL)
+            // Remove the corrupt partial and its validator so a retry re-downloads from scratch.
+            ResumableFileDownload.discardPartial(partURL)
             throw TextEncoderModelDownloaderError.downloadFailed("Hash or size verification failed for \(filePath)")
         }
-        if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
-        try FileManager.default.moveItem(at: partURL, to: destination)
+        try ResumableFileDownload.commit(partURL, to: destination)
     }
 
     private static func writeManifest(_ files: [HubFile], at directory: URL) throws {

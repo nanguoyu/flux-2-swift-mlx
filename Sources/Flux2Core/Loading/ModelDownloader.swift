@@ -300,7 +300,7 @@ public class Flux2ModelDownloader: @unchecked Sendable {
             Flux2Debug.log("Downloaded \(fileName) (\(Self.formatSize(completedBytes)) total)")
         }
 
-        Self.removeStaleFiles(in: destDir, keeping: filesToDownload, previouslyRecorded: previouslyRecorded)
+        Self.removeStaleFiles(for: component, keeping: filesToDownload, previouslyRecorded: previouslyRecorded)
 
         let verification = Self.verifyModel(at: destDir)
         guard verification.complete else { throw Flux2DownloadError.verificationFailed(verification.missing) }
@@ -338,11 +338,22 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         }
     }
 
-    /// After a successful download, delete what this downloader owns but no longer expects:
-    /// names recorded by an earlier manifest, and any stray `.safetensors` or `.part` (the
-    /// transformer loader reads EVERY top-level `.safetensors`, so a leftover text-encoder shard
-    /// would be merged into the transformer weights).
-    private static func removeStaleFiles(in directory: URL, keeping files: [HubFile], previouslyRecorded: Set<String>) {
+    /// After a successful download, delete what this downloader owns in `component`'s directory
+    /// but no longer expects: names recorded by an earlier manifest, any stray `.safetensors`, and
+    /// leftover `.part` files with their `.part.validator` sidecars.
+    ///
+    /// Why stray `.safetensors` go: the transformer loader reads EVERY top-level `.safetensors` in
+    /// the component directory, so a leftover shard (for example a text-encoder file from the old
+    /// recursive layout) would be merged into the transformer weights.
+    ///
+    /// Why this is safe: the directory is never a caller-supplied path. It is derived from the
+    /// registry (`ModelRegistry.localPath(for:)`), and nothing is touched unless that path, with
+    /// symlinks resolved, lies inside `ModelRegistry.modelsDirectory`, the root this downloader
+    /// creates and owns. Only regular files directly inside it are removed: symlinks (which may
+    /// point anywhere) and directories are always left alone.
+    static func removeStaleFiles(for component: ModelRegistry.ModelComponent, keeping files: [HubFile],
+                                 previouslyRecorded: Set<String>) {
+        guard let directory = managedDirectory(for: component) else { return }
         let expected = Set(files.map { URL(fileURLWithPath: $0.path).lastPathComponent })
         let fm = FileManager.default
         let contents = (try? fm.contentsOfDirectory(atPath: directory.path)) ?? []
@@ -350,12 +361,28 @@ public class Flux2ModelDownloader: @unchecked Sendable {
             let owned = previouslyRecorded.contains(name)
                 || name.hasSuffix(".safetensors")
                 || name.hasSuffix(".part")
+                || name.hasSuffix(".part.validator")
             guard owned else { continue }
-            var isDir: ObjCBool = false
             let url = directory.appendingPathComponent(name)
-            guard fm.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue else { continue }
+            // attributesOfItem does not follow a final symlink, so this sees the entry itself.
+            guard let type = (try? fm.attributesOfItem(atPath: url.path))?[.type] as? FileAttributeType,
+                  type == .typeRegular else { continue }
             try? fm.removeItem(at: url)
         }
+    }
+
+    /// `component`'s registry directory with symlinks resolved, or nil when it does not resolve
+    /// to a directory inside the models root (for example a symlink pointing elsewhere).
+    static func managedDirectory(for component: ModelRegistry.ModelComponent) -> URL? {
+        let root = ModelRegistry.modelsDirectory.resolvingSymlinksInPath().standardizedFileURL
+        let directory = ModelRegistry.localPath(for: component).resolvingSymlinksInPath().standardizedFileURL
+        let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        guard directory.path.hasPrefix(rootPath) else { return nil }
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDir), isDir.boolValue else {
+            return nil
+        }
+        return directory
     }
 
     private static func manifestFilenames(at directory: URL) -> Set<String> {
@@ -445,22 +472,20 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         }
 
         // STREAMING download straight into `.part`: a cancel or pause keeps every received byte and
-        // the next attempt resumes with a Range request (see ResumableFileDownload for the 200/206
-        // and Content-Range rules).
+        // the next attempt resumes with Range + If-Range (see ResumableFileDownload for the
+        // validator, 200/206 and Content-Range rules).
         let partURL = destination.appendingPathExtension("part")
         try await ResumableFileDownload.stream(request, into: partURL, filePath: filePath,
+                                               expectedSize: expectedSize,
                                                session: session, progress: progress)
 
         guard Self.fileMatches(partURL, expectedSize: expectedSize, expectedSHA256: expectedSHA256) else {
-            // Delete the corrupt partial so a retry re-downloads from scratch instead of forever
-            // resuming a bad prefix that fails verification identically.
-            try? FileManager.default.removeItem(at: partURL)
+            // Delete the corrupt partial (and its validator) so a retry re-downloads from scratch
+            // instead of forever resuming a bad prefix that fails verification identically.
+            ResumableFileDownload.discardPartial(partURL)
             throw Flux2DownloadError.downloadFailed("Hash or size verification failed for \(filePath)")
         }
-        if FileManager.default.fileExists(atPath: destination.path) {
-            try FileManager.default.removeItem(at: destination)
-        }
-        try FileManager.default.moveItem(at: partURL, to: destination)
+        try ResumableFileDownload.commit(partURL, to: destination)
 
         return destination
     }
