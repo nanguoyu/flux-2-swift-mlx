@@ -4,6 +4,7 @@
 
 import CryptoKit
 import XCTest
+import FluxTextEncoders
 @testable import Flux2Core
 
 /// Serves a fake HuggingFace tree listing plus file bodies, honoring `Range` and `If-Range`.
@@ -22,18 +23,21 @@ final class StubHub: URLProtocol {
 
     nonisolated(unsafe) private static var files: [String: Data] = [:]      // "repo/path" -> body
     nonisolated(unsafe) private static var listings: [String: [[String: Any]]] = [:]
+    nonisolated(unsafe) private static var revisions: [String: String] = [:]  // repo -> served revision
     nonisolated(unsafe) static var overrides: [String: (URLRequest) -> Response] = [:]
     nonisolated(unsafe) static var requests: [URLRequest] = []
     private static let lock = NSLock()
 
     static func reset() {
         lock.lock(); defer { lock.unlock() }
-        files = [:]; listings = [:]; overrides = [:]; requests = []
+        files = [:]; listings = [:]; revisions = [:]; overrides = [:]; requests = []
     }
 
-    /// Publish `repo` with `files` (path -> body). Bodies get LFS size + sha256 like the real API.
-    static func publish(repo: String, files repoFiles: [String: Data]) {
+    /// Publish `repo` at `revision` with `files` (path -> body). Bodies get LFS size + sha256 like
+    /// the real API. Listing and resolve requests for any other revision get 404.
+    static func publish(repo: String, revision: String = "main", files repoFiles: [String: Data]) {
         lock.lock(); defer { lock.unlock() }
+        revisions[repo] = revision
         var listing: [[String: Any]] = []
         for (path, body) in repoFiles.sorted(by: { $0.key < $1.key }) {
             files["\(repo)/\(path)"] = body
@@ -77,14 +81,25 @@ final class StubHub: URLProtocol {
         requests.append(request)
         let path = request.url!.path.removingPercentEncoding ?? request.url!.path
         let override = overrides[path]
-        let listingRepo = path.hasPrefix("/api/models/")
-            ? String(path.dropFirst("/api/models/".count).replacingOccurrences(of: "/tree/main", with: ""))
-            : nil
-        let listing = listingRepo.flatMap { listings[$0] }
+        // /api/models/<org>/<name>/tree/<revision>[/<folder>]: only the published revision lists,
+        // and a folder listing returns that folder's entries (with full paths) like the real API.
+        var listing: [[String: Any]]?
+        if path.hasPrefix("/api/models/") {
+            let parts = path.dropFirst("/api/models/".count).split(separator: "/", omittingEmptySubsequences: false)
+            if parts.count >= 4, parts[2] == "tree" {
+                let repo = "\(parts[0])/\(parts[1])"
+                let folder = parts.dropFirst(4).joined(separator: "/")
+                if revisions[repo] == String(parts[3]), let all = listings[repo] {
+                    listing = folder.isEmpty ? all : all.filter { ($0["path"] as! String).hasPrefix(folder + "/") }
+                }
+            }
+        }
+        // /<org>/<name>/resolve/<revision>/<path>
         var body: Data?
-        if let range = path.range(of: "/resolve/main/") {
-            let repo = String(path[path.index(after: path.startIndex)..<range.lowerBound])
-            body = files["\(repo)/\(path[range.upperBound...])"]
+        let parts = path.dropFirst().split(separator: "/", maxSplits: 4, omittingEmptySubsequences: false)
+        if parts.count == 5, parts[2] == "resolve" {
+            let repo = "\(parts[0])/\(parts[1])"
+            if revisions[repo] == String(parts[3]) { body = files["\(repo)/\(parts[4])"] }
         }
         lock.unlock()
 
@@ -111,6 +126,15 @@ final class StubHub: URLProtocol {
                             body: body.subdata(in: start..<body.count))
         }
         return Response(status: 200, headers: ["ETag": etag], body: body)
+    }
+
+    /// A pin naming `paths` of `files` (path -> body) at `revision`.
+    static func pin(revision: String, files: [String: Data], paths: [String]) -> HubSnapshotPin {
+        HubSnapshotPin(revision: revision, files: paths.map { path in
+            let body = files[path]!
+            let sha = SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()
+            return HubPinnedFile(path, size: Int64(body.count), sha256: sha)
+        })
     }
 
     static func configuration() -> URLSessionConfiguration {
@@ -141,15 +165,24 @@ final class ModelDownloaderLayoutTests: XCTestCase {
         ]
     }
 
+    /// The commit the stub serves; every test component is pinned to it.
+    private let rev = "0123456789abcdef0123456789abcdef01234567"
+    private let int8Paths = ["config.json", "diffusion_pytorch_model.safetensors", "quanto_qmap.json"]
+    private var int8Pin: HubSnapshotPin { StubHub.pin(revision: rev, files: int8Files, paths: int8Paths) }
+
     override func setUpWithError() throws {
         StubHub.reset()
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("flux2-downloader-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         ModelRegistry.customModelsDirectory = root
+        let pin = int8Pin
+        Flux2ModelDownloader.pinOverrideForTesting = { _ in pin }
     }
 
     override func tearDownWithError() throws {
+        Flux2ModelDownloader.pinOverrideForTesting = nil
+        HubDownloadPolicy.allowsUnpinnedRevisions = false
         ModelRegistry.customModelsDirectory = nil
         StubHub.reset()
         try? FileManager.default.removeItem(at: root)
@@ -185,7 +218,7 @@ final class ModelDownloaderLayoutTests: XCTestCase {
     // MARK: - Layout
 
     func testRootComponentDownloadsOnlyItsOwnTopLevelFiles() async throws {
-        StubHub.publish(repo: int8Repo, files: int8Files)
+        StubHub.publish(repo: int8Repo, revision: rev, files: int8Files)
 
         let dir = try await downloader().download(.transformer(.klein4B_8bit))
 
@@ -222,8 +255,7 @@ final class ModelDownloaderLayoutTests: XCTestCase {
     func testLegacyLayoutWithoutManifestStaysInstalledAndIsNotRefetched() async throws {
         let dir = int8Dir
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try Data("{}".utf8).write(to: dir.appendingPathComponent("config.json"))
-        try transformerBody.write(to: dir.appendingPathComponent("diffusion_pytorch_model.safetensors"))
+        for name in int8Paths { try int8Files[name]!.write(to: dir.appendingPathComponent(name)) }
 
         XCTAssertTrue(Flux2ModelDownloader.isDownloaded(.transformer(.klein4B_8bit)))
         _ = try await downloader().download(.transformer(.klein4B_8bit))
@@ -252,7 +284,7 @@ final class ModelDownloaderLayoutTests: XCTestCase {
 
         XCTAssertFalse(Flux2ModelDownloader.isDownloaded(.transformer(.klein4B_8bit)))
 
-        StubHub.publish(repo: int8Repo, files: int8Files)
+        StubHub.publish(repo: int8Repo, revision: rev, files: int8Files)
         _ = try await downloader().download(.transformer(.klein4B_8bit))
 
         XCTAssertEqual(topLevelNames(dir).subtracting([".mobile-diffuser-download-manifest.json"]),
@@ -265,9 +297,9 @@ final class ModelDownloaderLayoutTests: XCTestCase {
     // MARK: - Interruption and resume
 
     func testInterruptedFirstDownloadIsNotReportedInstalled() async throws {
-        StubHub.publish(repo: int8Repo, files: int8Files)
+        StubHub.publish(repo: int8Repo, revision: rev, files: int8Files)
         // The weights arrive; the last file of the component fails.
-        StubHub.overrides["/\(int8Repo)/resolve/main/quanto_qmap.json"] = { _ in
+        StubHub.overrides["/\(int8Repo)/resolve/\(rev)/quanto_qmap.json"] = { _ in
             .init(status: 503, headers: [:], body: Data())
         }
 
@@ -283,7 +315,7 @@ final class ModelDownloaderLayoutTests: XCTestCase {
     }
 
     func testPartialFileResumesFromTheRetainedByteCount() async throws {
-        StubHub.publish(repo: int8Repo, files: int8Files)
+        StubHub.publish(repo: int8Repo, revision: rev, files: int8Files)
         try retainPrefix(transformerBody.prefix(1000), etag: StubHub.etag(transformerBody))
 
         _ = try await downloader().download(.transformer(.klein4B_8bit))
@@ -298,10 +330,10 @@ final class ModelDownloaderLayoutTests: XCTestCase {
     }
 
     func testMisplacedPartialResponseIsRejectedBeforeAppend() async throws {
-        StubHub.publish(repo: int8Repo, files: int8Files)
+        StubHub.publish(repo: int8Repo, revision: rev, files: int8Files)
         try retainPrefix(transformerBody.prefix(1000), etag: StubHub.etag(transformerBody))
         let body = transformerBody
-        StubHub.overrides["/\(int8Repo)/resolve/main/\(weightsName)"] = { _ in
+        StubHub.overrides["/\(int8Repo)/resolve/\(rev)/\(weightsName)"] = { _ in
             .init(status: 206, headers: ["Content-Range": "bytes 0-\(body.count - 1)/\(body.count)"], body: body)
         }
 
@@ -317,7 +349,7 @@ final class ModelDownloaderLayoutTests: XCTestCase {
     // MARK: - Resume validator
 
     func testFreshDownloadSendsNoRangeAndLeavesNoSidecar() async throws {
-        StubHub.publish(repo: int8Repo, files: int8Files)
+        StubHub.publish(repo: int8Repo, revision: rev, files: int8Files)
 
         _ = try await downloader().download(.transformer(.klein4B_8bit))
 
@@ -327,7 +359,7 @@ final class ModelDownloaderLayoutTests: XCTestCase {
     }
 
     func testPartialWithoutValidatorRestartsFromZero() async throws {
-        StubHub.publish(repo: int8Repo, files: int8Files)
+        StubHub.publish(repo: int8Repo, revision: rev, files: int8Files)
         // Bytes that are NOT a prefix of the file: appending to them would fail verification.
         try retainPrefix(Data(repeating: 0xEE, count: 1000), etag: nil)
 
@@ -339,7 +371,7 @@ final class ModelDownloaderLayoutTests: XCTestCase {
     }
 
     func testChangedETagRestartsFromZero() async throws {
-        StubHub.publish(repo: int8Repo, files: int8Files)
+        StubHub.publish(repo: int8Repo, revision: rev, files: int8Files)
         // The retained prefix came from an older upload of the same path.
         try retainPrefix(Data(repeating: 0xEE, count: 1000), etag: "\"old-upload\"")
 
@@ -354,11 +386,11 @@ final class ModelDownloaderLayoutTests: XCTestCase {
     }
 
     func testPartialResponseForAFileOfAnotherSizeIsRejected() async throws {
-        StubHub.publish(repo: int8Repo, files: int8Files)
+        StubHub.publish(repo: int8Repo, revision: rev, files: int8Files)
         let etag = StubHub.etag(transformerBody)
         try retainPrefix(transformerBody.prefix(1000), etag: etag)
         let body = transformerBody
-        StubHub.overrides["/\(int8Repo)/resolve/main/\(weightsName)"] = { _ in
+        StubHub.overrides["/\(int8Repo)/resolve/\(rev)/\(weightsName)"] = { _ in
             .init(status: 206, headers: ["Content-Range": "bytes 1000-\(body.count - 1)/9999", "ETag": etag],
                   body: body.subdata(in: 1000..<body.count))
         }
@@ -375,11 +407,11 @@ final class ModelDownloaderLayoutTests: XCTestCase {
     }
 
     func testPartialResponseWithADifferentETagIsRejected() async throws {
-        StubHub.publish(repo: int8Repo, files: int8Files)
+        StubHub.publish(repo: int8Repo, revision: rev, files: int8Files)
         try retainPrefix(transformerBody.prefix(1000), etag: StubHub.etag(transformerBody))
         let body = transformerBody
         // A server that ignores If-Range and serves a range of a different upload.
-        StubHub.overrides["/\(int8Repo)/resolve/main/\(weightsName)"] = { _ in
+        StubHub.overrides["/\(int8Repo)/resolve/\(rev)/\(weightsName)"] = { _ in
             .init(status: 206, headers: ["Content-Range": "bytes 1000-\(body.count - 1)/\(body.count)",
                                          "ETag": "\"another-upload\""],
                   body: body.subdata(in: 1000..<body.count))
@@ -394,11 +426,11 @@ final class ModelDownloaderLayoutTests: XCTestCase {
     }
 
     func testRedirectToCDNKeepsRangeAndIfRange() async throws {
-        StubHub.publish(repo: int8Repo, files: int8Files)
+        StubHub.publish(repo: int8Repo, revision: rev, files: int8Files)
         let body = transformerBody
         let cdnETag = "\"cdn-object\""
         try retainPrefix(body.prefix(1000), etag: cdnETag)
-        StubHub.overrides["/\(int8Repo)/resolve/main/\(weightsName)"] = { _ in
+        StubHub.overrides["/\(int8Repo)/resolve/\(rev)/\(weightsName)"] = { _ in
             .init(status: 302, headers: ["ETag": "\"hub-redirect\""], body: Data(),
                   redirect: URL(string: "https://cdn.stub.invalid/blob/weights")!)
         }
@@ -417,7 +449,7 @@ final class ModelDownloaderLayoutTests: XCTestCase {
     // MARK: - Stale-file cleanup
 
     func testCleanupRemovesStrayWeightsAndStalePartialsButNotLinksOrDirectories() async throws {
-        StubHub.publish(repo: int8Repo, files: int8Files)
+        StubHub.publish(repo: int8Repo, revision: rev, files: int8Files)
         let dir = int8Dir
         let fm = FileManager.default
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)

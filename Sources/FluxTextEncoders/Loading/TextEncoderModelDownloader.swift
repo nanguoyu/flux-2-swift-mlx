@@ -25,10 +25,34 @@ public class TextEncoderModelDownloader {
             var sha256: String?
         }
         var version: Int = 1
+        /// The pinned commit the files were taken from (version 2). Version 1 manifests, written
+        /// from an unpinned `main` listing, have none; both decode, and older readers ignore it.
+        var revision: String? = nil
         var files: [File]
     }
 
     private static let manifestFilename = ".mobile-diffuser-download-manifest.json"
+
+    /// Test seam: replaces `Qwen3Variant.pinnedSnapshot` (return nil to treat a variant as
+    /// unpinned). Never set outside tests.
+    nonisolated(unsafe) static var qwen3PinOverrideForTesting: ((Qwen3Variant) -> HubSnapshotPin?)?
+
+    /// The snapshot a Qwen3 download of `repoId` for `variant` is pinned to. A model info whose
+    /// repository is not the variant's own is never pinned (its files are not the pinned ones).
+    static func qwen3Pin(for variant: Qwen3Variant, repoId: String) -> HubSnapshotPin? {
+        guard repoId == variant.repoId else { return nil }
+        if let override = qwen3PinOverrideForTesting { return override(variant) }
+        return variant.pinnedSnapshot
+    }
+
+    /// Whether `path` holds a complete Qwen3 install. Pinned variants need every pinned file at its
+    /// pinned size (small files also by hash), whatever manifest the directory carries; unpinned
+    /// ones keep the manifest check. Weights are never re-hashed here.
+    private static func isQwen3Installed(at path: URL, pin: HubSnapshotPin?) -> Bool {
+        guard verifyShardedModel(at: path).complete else { return false }
+        if let pin { return pin.isInstalled(at: path) }
+        return verifyManifestIfPresent(at: path)
+    }
 
     /// HuggingFace token for private/gated models
     private var hfToken: String?
@@ -353,8 +377,16 @@ public class TextEncoderModelDownloader {
         print("Repository: \(model.repoId)")
         print()
 
+        let pin = Self.qwen3Pin(for: model.variant, repoId: model.repoId)
+        guard pin != nil || HubDownloadPolicy.allowsUnpinnedRevisions else {
+            throw TextEncoderModelDownloaderError.downloadFailed(
+                "\(model.name) has no pinned revision of \(model.repoId); set "
+                + "HubDownloadPolicy.allowsUnpinnedRevisions to download it from main"
+            )
+        }
         let modelUrl = try await downloadResumableSnapshot(
             repoId: model.repoId,
+            pin: pin,
             matching: { path in path.hasSuffix(".json") || path.hasSuffix(".safetensors") || path == "tokenizer.model" },
             progress: progress
         )
@@ -372,13 +404,28 @@ public class TextEncoderModelDownloader {
 
     private func downloadResumableSnapshot(
         repoId: String,
+        pin: HubSnapshotPin?,
         matching: @escaping (String) -> Bool,
         progress: TextEncoderDownloadProgressCallback? = nil
     ) async throws -> URL {
-        let allFiles = try await fetchHubFiles(repoId: repoId)
-        // The destination is one flat directory: only the repo's top-level files belong in it, so
-        // same-named files from nested folders can never overwrite each other.
-        let files = allFiles.filter { !$0.path.contains("/") && matching($0.path) }
+        let revision = pin?.revision ?? "main"
+        let allFiles = try await fetchHubFiles(repoId: repoId, revision: revision)
+        let files: [HubFile]
+        if let pin {
+            // The pin is the only source of names, sizes and hashes: files the listing adds are
+            // ignored, and a listing that lacks a pinned file stops the download before any fetch.
+            let missing = pin.filesMissing(fromListing: Set(allFiles.map(\.path)))
+            guard missing.isEmpty else {
+                throw TextEncoderModelDownloaderError.downloadFailed(
+                    "\(repoId)@\(revision) does not list pinned file(s): \(missing.joined(separator: ", "))"
+                )
+            }
+            files = pin.files.map { HubFile(path: $0.path, size: $0.size, sha256: $0.sha256) }
+        } else {
+            // The destination is one flat directory: only the repo's top-level files belong in it,
+            // so same-named files from nested folders can never overwrite each other.
+            files = allFiles.filter { !$0.path.contains("/") && matching($0.path) }
+        }
         guard !files.isEmpty else { throw TextEncoderModelDownloaderError.downloadFailed("No model files found in \(repoId)") }
 
         var destDir = Self.hubDownloadDirectory
@@ -388,7 +435,7 @@ public class TextEncoderModelDownloader {
         // Record the expected file set BEFORE fetching anything, so an interrupted download (for
         // example after the weights landed but before the tokenizer files) is never reported as
         // installed by findQwen3ModelPath().
-        try Self.writeManifest(files, at: destDir)
+        try Self.writeManifest(files, revision: pin?.revision, at: destDir)
 
         let totalBytes = max(1, files.reduce(Int64(0)) { $0 + ($1.size ?? 0) })
         var completedBytes: Int64 = 0
@@ -401,17 +448,20 @@ public class TextEncoderModelDownloader {
                 continue
             }
             let baseBytes = completedBytes
-            try await downloadFile(repoId: repoId, filePath: file.path, to: destination,
+            try await downloadFile(repoId: repoId, revision: revision, filePath: file.path, to: destination,
                                    expectedSize: file.size, expectedSHA256: file.sha256) { bytes in
                 progress?(min(1, Double(baseBytes + bytes) / Double(totalBytes)), "Downloading \(filename)")
             }
             completedBytes += Self.fileSize(destination)
         }
+        if let pin, !pin.isInstalled(at: destDir) {
+            throw TextEncoderModelDownloaderError.downloadFailed("Verification failed for \(repoId)@\(revision)")
+        }
         return destDir
     }
 
-    private func fetchHubFiles(repoId: String) async throws -> [HubFile] {
-        let urlString = "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=1&expand=1"
+    private func fetchHubFiles(repoId: String, revision: String) async throws -> [HubFile] {
+        let urlString = "https://huggingface.co/api/models/\(repoId)/tree/\(revision)?recursive=1&expand=1"
         guard let url = URL(string: urlString) else {
             throw TextEncoderModelDownloaderError.downloadFailed("Invalid URL: \(urlString)")
         }
@@ -434,13 +484,13 @@ public class TextEncoderModelDownloader {
         }
     }
 
-    private func downloadFile(repoId: String, filePath: String, to destination: URL,
+    private func downloadFile(repoId: String, revision: String, filePath: String, to destination: URL,
                               expectedSize: Int64?, expectedSHA256: String?,
                               progress: @escaping @Sendable (Int64) -> Void) async throws {
         if Self.fileMatches(destination, expectedSize: expectedSize, expectedSHA256: expectedSHA256) {
             progress(expectedSize ?? Self.fileSize(destination)); return
         }
-        let urlString = "https://huggingface.co/\(repoId)/resolve/main/\(filePath)"
+        let urlString = "https://huggingface.co/\(repoId)/resolve/\(revision)/\(filePath)"
         guard let url = URL(string: urlString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? urlString) else {
             throw TextEncoderModelDownloaderError.downloadFailed("Invalid URL: \(urlString)")
         }
@@ -460,8 +510,8 @@ public class TextEncoderModelDownloader {
         try ResumableFileDownload.commit(partURL, to: destination)
     }
 
-    private static func writeManifest(_ files: [HubFile], at directory: URL) throws {
-        let manifest = DownloadManifest(files: files.map {
+    private static func writeManifest(_ files: [HubFile], revision: String?, at directory: URL) throws {
+        let manifest = DownloadManifest(version: revision == nil ? 1 : 2, revision: revision, files: files.map {
             DownloadManifest.File(filename: URL(fileURLWithPath: $0.path).lastPathComponent,
                                   size: $0.size, sha256: $0.sha256)
         })
@@ -525,71 +575,19 @@ public class TextEncoderModelDownloader {
     /// Find a Qwen3 model path (checks Hub cache)
     /// Verifies safetensors files are complete before returning path
     public static func findQwen3ModelPath(for model: Qwen3ModelInfo) -> URL? {
-        // Check Hub download directory: {hubDownloadDirectory}/{org}/{repo}
-        var newPath = hubDownloadDirectory
-        for component in model.repoId.split(separator: "/") {
-            newPath = newPath.appendingPathComponent(String(component))
-        }
-
-        if FileManager.default.fileExists(atPath: newPath.appendingPathComponent("config.json").path) {
-            // Verify safetensors files are complete
-            let verification = verifyShardedModel(at: newPath)
-            if verification.complete && verifyManifestIfPresent(at: newPath) {
-                return newPath
-            }
-        }
-
-        // Check legacy location
-        let homeDir = legacyHomeDirectory
-        let hubCache = homeDir
-            .appendingPathComponent(".cache")
-            .appendingPathComponent("huggingface")
-            .appendingPathComponent("hub")
-
-        let modelFolder = "models--\(model.repoId.replacingOccurrences(of: "/", with: "--"))"
-        let snapshotsDir = hubCache.appendingPathComponent(modelFolder).appendingPathComponent("snapshots")
-
-        guard let contents = try? FileManager.default.contentsOfDirectory(atPath: snapshotsDir.path),
-              let latestSnapshot = contents.sorted().last else {
-            return nil
-        }
-
-        let modelPath = snapshotsDir.appendingPathComponent(latestSnapshot)
-        let configPath = modelPath.appendingPathComponent("config.json")
-
-        if FileManager.default.fileExists(atPath: configPath.path) {
-            // Verify safetensors files are complete
-            let verification = verifyShardedModel(at: modelPath)
-            if verification.complete && verifyManifestIfPresent(at: modelPath) {
-                return modelPath
-            }
-        }
-
-        return nil
+        findQwen3ModelPath(repoId: model.repoId, pin: qwen3Pin(for: model.variant, repoId: model.repoId))
     }
 
-    /// Check if a Qwen3 model is already downloaded
-    public static func isQwen3ModelDownloaded(_ model: Qwen3ModelInfo) -> Bool {
-        return findQwen3ModelPath(for: model) != nil
-    }
-
-    /// Find a Qwen3 model path by variant
-    /// Verifies safetensors files are complete before returning path
-    public static func findQwen3ModelPath(for variant: Qwen3Variant) -> URL? {
-        let repoId = variant.repoId
-
+    private static func findQwen3ModelPath(repoId: String, pin: HubSnapshotPin?) -> URL? {
         // Check Hub download directory: {hubDownloadDirectory}/{org}/{repo}
         var newPath = hubDownloadDirectory
         for component in repoId.split(separator: "/") {
             newPath = newPath.appendingPathComponent(String(component))
         }
 
-        if FileManager.default.fileExists(atPath: newPath.appendingPathComponent("config.json").path) {
-            // Verify safetensors files are complete
-            let verification = verifyShardedModel(at: newPath)
-            if verification.complete && verifyManifestIfPresent(at: newPath) {
-                return newPath
-            }
+        if FileManager.default.fileExists(atPath: newPath.appendingPathComponent("config.json").path),
+           isQwen3Installed(at: newPath, pin: pin) {
+            return newPath
         }
 
         // Check legacy location
@@ -607,18 +605,28 @@ public class TextEncoderModelDownloader {
             return nil
         }
 
-        let modelPath = snapshotsDir.appendingPathComponent(latestSnapshot)
+        // The HF CLI names snapshot folders by commit: prefer the pinned one when it is there.
+        let snapshot = pin.flatMap { contents.contains($0.revision) ? $0.revision : nil } ?? latestSnapshot
+        let modelPath = snapshotsDir.appendingPathComponent(snapshot)
         let configPath = modelPath.appendingPathComponent("config.json")
 
-        if FileManager.default.fileExists(atPath: configPath.path) {
-            // Verify safetensors files are complete
-            let verification = verifyShardedModel(at: modelPath)
-            if verification.complete && verifyManifestIfPresent(at: modelPath) {
-                return modelPath
-            }
+        if FileManager.default.fileExists(atPath: configPath.path),
+           isQwen3Installed(at: modelPath, pin: pin) {
+            return modelPath
         }
 
         return nil
+    }
+
+    /// Check if a Qwen3 model is already downloaded
+    public static func isQwen3ModelDownloaded(_ model: Qwen3ModelInfo) -> Bool {
+        return findQwen3ModelPath(for: model) != nil
+    }
+
+    /// Find a Qwen3 model path by variant
+    /// Verifies safetensors files are complete before returning path
+    public static func findQwen3ModelPath(for variant: Qwen3Variant) -> URL? {
+        findQwen3ModelPath(repoId: variant.repoId, pin: qwen3Pin(for: variant, repoId: variant.repoId))
     }
 
     /// Check if a Qwen3 model is already downloaded by variant

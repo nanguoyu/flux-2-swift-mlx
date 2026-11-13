@@ -7,6 +7,8 @@ import XCTest
 /// Fake HuggingFace tree listing + file bodies for one repo, honoring `Range`.
 final class QwenStubHub: URLProtocol {
     nonisolated(unsafe) static var repo = ""
+    /// The only revision served; listing and resolve requests for any other get 404.
+    nonisolated(unsafe) static var revision = "main"
     nonisolated(unsafe) static var files: [String: Data] = [:]
     nonisolated(unsafe) static var failing: Set<String> = []
     nonisolated(unsafe) static var requests: [URLRequest] = []
@@ -14,7 +16,16 @@ final class QwenStubHub: URLProtocol {
 
     static func reset() {
         lock.lock(); defer { lock.unlock() }
-        repo = ""; files = [:]; failing = []; requests = []
+        repo = ""; revision = "main"; files = [:]; failing = []; requests = []
+    }
+
+    /// A pin naming `names` of the published files at the served revision.
+    static func pin(_ names: [String]) -> HubSnapshotPin {
+        HubSnapshotPin(revision: revision, files: names.map { name in
+            let data = files[name]!
+            let sha = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            return HubPinnedFile(name, size: Int64(data.count), sha256: sha)
+        })
     }
 
     static func etag(_ data: Data) -> String {
@@ -29,13 +40,13 @@ final class QwenStubHub: URLProtocol {
         Self.lock.lock()
         Self.requests.append(request)
         let path = request.url!.path.removingPercentEncoding ?? request.url!.path
-        let repo = Self.repo, files = Self.files, failing = Self.failing
+        let repo = Self.repo, revision = Self.revision, files = Self.files, failing = Self.failing
         Self.lock.unlock()
 
         var status = 404
         var headers: [String: String] = [:]
         var body = Data()
-        if path == "/api/models/\(repo)/tree/main" {
+        if path == "/api/models/\(repo)/tree/\(revision)" {
             let listing: [[String: Any]] = files.keys.sorted().map { name in
                 let data = files[name]!
                 let sha = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
@@ -43,8 +54,8 @@ final class QwenStubHub: URLProtocol {
             }
             status = 200
             body = try! JSONSerialization.data(withJSONObject: listing)
-        } else if path.hasPrefix("/\(repo)/resolve/main/") {
-            let name = String(path.dropFirst("/\(repo)/resolve/main/".count))
+        } else if path.hasPrefix("/\(repo)/resolve/\(revision)/") {
+            let name = String(path.dropFirst("/\(repo)/resolve/\(revision)/".count))
             if failing.contains(name) {
                 status = 503
             } else if let data = files[name] {
@@ -86,6 +97,10 @@ final class Qwen3DownloadResumeTests: XCTestCase {
             "tokenizer_config.json": Data(#"{"c":1}"#.utf8),
             "nested/config.json": Data(#"{"other":1}"#.utf8),
         ]
+        // Pinned to a fixed commit, like the shipped variants: the top-level files only.
+        QwenStubHub.revision = "89abcdef0123456789abcdef0123456789abcdef"
+        let pin = QwenStubHub.pin(["config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json"])
+        TextEncoderModelDownloader.qwen3PinOverrideForTesting = { _ in pin }
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("qwen3-downloader-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -93,6 +108,7 @@ final class Qwen3DownloadResumeTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        TextEncoderModelDownloader.qwen3PinOverrideForTesting = nil
         TextEncoderModelDownloader.customModelsDirectory = nil
         QwenStubHub.reset()
         try? FileManager.default.removeItem(at: root)

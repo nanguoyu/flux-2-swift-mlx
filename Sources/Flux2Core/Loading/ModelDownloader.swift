@@ -23,10 +23,32 @@ public class Flux2ModelDownloader: @unchecked Sendable {
             var sha256: String?
         }
         var version: Int = 1
+        /// The pinned commit the files were taken from (version 2). Version 1 manifests, written
+        /// from an unpinned `main` listing, have none; both decode, and older readers ignore it.
+        var revision: String? = nil
         var files: [File]
     }
 
     private static let manifestFilename = ".mobile-diffuser-download-manifest.json"
+
+    /// Test seam: replaces the variants' own `pinnedSnapshot` (return nil to treat a component as
+    /// unpinned). Never set outside tests.
+    nonisolated(unsafe) static var pinOverrideForTesting: ((ModelRegistry.ModelComponent) -> HubSnapshotPin?)?
+
+    /// The snapshot `component` is pinned to, if any.
+    static func pin(for component: ModelRegistry.ModelComponent) -> HubSnapshotPin? {
+        if let override = pinOverrideForTesting { return override(component) }
+        return component.pinnedSnapshot
+    }
+
+    /// Whether `path` holds a complete install of a component. Pinned components need every pinned
+    /// file at its pinned size (small files also by hash), whatever manifest the directory carries;
+    /// unpinned ones keep the manifest check. Weights are never re-hashed here.
+    static func isInstalled(at path: URL, pin: HubSnapshotPin?) -> Bool {
+        guard verifyModel(at: path).complete else { return false }
+        if let pin { return pin.isInstalled(at: path) }
+        return verifyManifestIfPresent(at: path)
+    }
 
     /// HuggingFace token for gated models
     private var hfToken: String?
@@ -63,6 +85,8 @@ public class Flux2ModelDownloader: @unchecked Sendable {
 
     /// Find local path for a model component
     public static func findModelPath(for component: ModelRegistry.ModelComponent) -> URL? {
+        let pin = pin(for: component)
+
         // Check our local models directory
         let localPath = ModelRegistry.localPath(for: component)
 
@@ -73,8 +97,7 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         let hasShardIndex = FileManager.default.fileExists(atPath: localPath.appendingPathComponent("model.safetensors.index.json").path)
 
         if hasConfig || hasModelIndex || hasShardIndex {
-            let verification = verifyModel(at: localPath)
-            if verification.complete && verifyManifestIfPresent(at: localPath) {
+            if isInstalled(at: localPath, pin: pin) {
                 return localPath
             }
         }
@@ -92,8 +115,7 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         let cacheHasShardIndex = FileManager.default.fileExists(atPath: path.appendingPathComponent("model.safetensors.index.json").path)
 
         if cacheHasConfig || cacheHasModelIndex || cacheHasShardIndex {
-            let verification = verifyModel(at: path)
-            if verification.complete && verifyManifestIfPresent(at: path) {
+            if isInstalled(at: path, pin: pin) {
                 return path
             }
         }
@@ -115,7 +137,9 @@ public class Flux2ModelDownloader: @unchecked Sendable {
             return nil
         }
 
-        let modelPath = snapshotsDir.appendingPathComponent(latestSnapshot)
+        // The HF CLI names snapshot folders by commit: prefer the pinned one when it is there.
+        let snapshot = pin.flatMap { contents.contains($0.revision) ? $0.revision : nil } ?? latestSnapshot
+        let modelPath = snapshotsDir.appendingPathComponent(snapshot)
         let configPath = modelPath.appendingPathComponent("config.json")
         let modelIndexPath = modelPath.appendingPathComponent("model_index.json")
         let shardIndexPath = modelPath.appendingPathComponent("model.safetensors.index.json")
@@ -123,9 +147,8 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         if FileManager.default.fileExists(atPath: configPath.path) ||
            FileManager.default.fileExists(atPath: modelIndexPath.path) ||
            FileManager.default.fileExists(atPath: shardIndexPath.path) {
-            // Verify safetensors files are complete
-            let verification = verifyModel(at: modelPath)
-            if verification.complete && verifyManifestIfPresent(at: modelPath) {
+            // Verify safetensors files are complete (and match the pin, when there is one)
+            if isInstalled(at: modelPath, pin: pin) {
                 return modelPath
             }
         }
@@ -240,14 +263,36 @@ public class Flux2ModelDownloader: @unchecked Sendable {
 
         let repoId = Self.repoId(for: component)
         let subfolder = Self.subfolder(for: component)
+        let pin = Self.pin(for: component)
+        guard pin != nil || HubDownloadPolicy.allowsUnpinnedRevisions else {
+            throw Flux2DownloadError.downloadFailed(
+                "\(component.displayName) has no pinned revision of \(repoId); set "
+                + "HubDownloadPolicy.allowsUnpinnedRevisions to download it from main"
+            )
+        }
+        let revision = pin?.revision ?? "main"
         progress?(0.0, "Fetching file list for \(component.displayName)...")
 
-        Flux2Debug.log("Downloading \(component.displayName) from \(repoId)")
+        Flux2Debug.log("Downloading \(component.displayName) from \(repoId)@\(revision)")
 
-        // Get file list from HuggingFace API
-        let files = try await fetchFileList(repoId: repoId, subfolder: subfolder)
+        // Get file list from HuggingFace API, at the pinned commit when there is one
+        let files = try await fetchFileList(repoId: repoId, revision: revision, subfolder: subfolder)
 
-        let filesToDownload = Self.componentFiles(from: files, subfolder: subfolder)
+        let filesToDownload: [HubFile]
+        if let pin {
+            // The pin is the only source of names, sizes and hashes: files the listing adds are
+            // ignored, and a listing that lacks a pinned file means the revision is not what was
+            // pinned (or is no longer readable), so nothing is fetched.
+            let missing = pin.filesMissing(fromListing: Set(files.map(\.path)))
+            guard missing.isEmpty else {
+                throw Flux2DownloadError.downloadFailed(
+                    "\(repoId)@\(revision) does not list pinned file(s): \(missing.joined(separator: ", "))"
+                )
+            }
+            filesToDownload = pin.files.map { HubFile(path: $0.path, size: $0.size, sha256: $0.sha256) }
+        } else {
+            filesToDownload = Self.componentFiles(from: files, subfolder: subfolder)
+        }
 
         guard !filesToDownload.isEmpty else {
             throw Flux2DownloadError.modelNotFound("No model files found in \(repoId)")
@@ -264,7 +309,7 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         // Record the expected file set BEFORE fetching anything: until every listed file is present
         // with its expected size, findModelPath() rejects this directory, so an interrupted first
         // download can never read as installed just because one weight file already landed.
-        try Self.writeManifest(filesToDownload, at: destDir)
+        try Self.writeManifest(filesToDownload, revision: pin?.revision, at: destDir)
 
         // Download each file
         let totalBytes = max(1, filesToDownload.reduce(Int64(0)) { $0 + ($1.size ?? 0) })
@@ -283,6 +328,7 @@ public class Flux2ModelDownloader: @unchecked Sendable {
             let baseBytes = completedBytes
             let fileURL = try await downloadFile(
                 repoId: repoId,
+                revision: revision,
                 filePath: file.path,
                 to: destination,
                 expectedSize: file.size,
@@ -304,6 +350,9 @@ public class Flux2ModelDownloader: @unchecked Sendable {
 
         let verification = Self.verifyModel(at: destDir)
         guard verification.complete else { throw Flux2DownloadError.verificationFailed(verification.missing) }
+        if let pin, !pin.isInstalled(at: destDir) {
+            throw Flux2DownloadError.verificationFailed(pin.files.map(\.filename))
+        }
 
         progress?(1.0, "Download complete: \(Self.formatSize(completedBytes))")
         return destDir
@@ -393,8 +442,8 @@ public class Flux2ModelDownloader: @unchecked Sendable {
     }
 
     /// Fetch file list from HuggingFace API
-    private func fetchFileList(repoId: String, subfolder: String?) async throws -> [HubFile] {
-        var urlString = "https://huggingface.co/api/models/\(repoId)/tree/main"
+    private func fetchFileList(repoId: String, revision: String, subfolder: String?) async throws -> [HubFile] {
+        var urlString = "https://huggingface.co/api/models/\(repoId)/tree/\(revision)"
         if let subfolder = subfolder {
             urlString += "/\(subfolder)"
         }
@@ -452,7 +501,7 @@ public class Flux2ModelDownloader: @unchecked Sendable {
     }
 
     /// Download a single file from HuggingFace
-    private func downloadFile(repoId: String, filePath: String, to destination: URL,
+    private func downloadFile(repoId: String, revision: String, filePath: String, to destination: URL,
                               expectedSize: Int64?, expectedSHA256: String?,
                               progress: @escaping @Sendable (Int64) -> Void) async throws -> URL {
         if Self.fileMatches(destination, expectedSize: expectedSize, expectedSHA256: expectedSHA256) {
@@ -460,7 +509,7 @@ public class Flux2ModelDownloader: @unchecked Sendable {
             return destination
         }
 
-        let urlString = "https://huggingface.co/\(repoId)/resolve/main/\(filePath)"
+        let urlString = "https://huggingface.co/\(repoId)/resolve/\(revision)/\(filePath)"
 
         guard let url = URL(string: urlString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? urlString) else {
             throw Flux2DownloadError.downloadFailed("Invalid URL: \(urlString)")
@@ -490,8 +539,8 @@ public class Flux2ModelDownloader: @unchecked Sendable {
         return destination
     }
 
-    private static func writeManifest(_ files: [HubFile], at directory: URL) throws {
-        let manifest = DownloadManifest(files: files.map {
+    private static func writeManifest(_ files: [HubFile], revision: String?, at directory: URL) throws {
+        let manifest = DownloadManifest(version: revision == nil ? 1 : 2, revision: revision, files: files.map {
             DownloadManifest.File(filename: URL(fileURLWithPath: $0.path).lastPathComponent,
                                   size: $0.size, sha256: $0.sha256)
         })

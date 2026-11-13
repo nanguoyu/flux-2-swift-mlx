@@ -13,6 +13,11 @@ struct Flux2App: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var modelManager = ModelManager()
 
+    init() {
+        // The demo app offers every variant, including those without a pinned revision.
+        HubDownloadPolicy.allowsUnpinnedRevisions = true
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()

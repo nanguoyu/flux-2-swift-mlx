@@ -76,6 +76,10 @@ final class ModelDirectoryTests: XCTestCase {
 
         // Point customModelsDirectory to our temp dir
         ModelRegistry.customModelsDirectory = tempDir
+        // This test is about WHERE the lookup looks; the placeholder files cannot match the
+        // shipped pin, so the variant is treated as unpinned here (ModelPinningTests covers pins).
+        Flux2ModelDownloader.pinOverrideForTesting = { _ in nil }
+        defer { Flux2ModelDownloader.pinOverrideForTesting = nil }
 
         // localPath should point into our custom directory
         let localPath = ModelRegistry.localPath(for: .transformer(.klein4B_bf16))

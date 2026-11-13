@@ -39,6 +39,22 @@ struct Flux2CLI: AsyncParsableCommand {
         ],
         defaultSubcommand: TextToImage.self
     )
+
+    /// This tool offers every variant, including those without a pinned revision, so it opts in
+    /// to downloading them from `main` before running the command.
+    static func main() async {
+        HubDownloadPolicy.allowsUnpinnedRevisions = true
+        do {
+            var command = try parseAsRoot()
+            if var asyncCommand = command as? AsyncParsableCommand {
+                try await asyncCommand.run()
+            } else {
+                try command.run()
+            }
+        } catch {
+            exit(withError: error)
+        }
+    }
 }
 
 // MARK: - Text-to-Image Command
